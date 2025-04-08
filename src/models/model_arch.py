@@ -8,125 +8,125 @@ Supports:
   - RMSNorm
   - (Optional) fused cross-entropy that does not materialize logits
   - Segment-aware block mask
-  - FAN-in (as seen in JAX, similar to OLMO 2) param inits
+  - FAN-in param inits
 ===============================================================================
 """
 
-from transformers import AutoModelForCausalLM
-from transformers.models.llama.configuration_llama import LlamaConfig
 import math
-from typing import Optional, Any
 import os
+import logging
+from typing import Optional, Any, Union, Dict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 import einops
-import torch.nn.attention.flex_attention as flex_attention
-from torch.nn.attention.flex_attention import create_block_mask
-from torch.utils.checkpoint import checkpoint
 
-import logging
+try:
+    from torch.nn.attention.flex_attention import create_block_mask
+    from torch.nn.attention.flex_attention import flex_attention as _raw_flex_attention
+
+    # Example compile options if needed:
+    _flex_attention = torch.compile(_raw_flex_attention, dynamic=True, options={})
+    FLEX_ATTENTION_AVAILABLE = True
+except ImportError:
+    FLEX_ATTENTION_AVAILABLE = False
+    logging.warning("flex_attention not found; fallback or error will occur if used.")
+
 from safetensors.torch import load_file as load_safetensors_file
-import torch
+from transformers import AutoModelForCausalLM
+from transformers.models.llama.configuration_llama import LlamaConfig
 
-prenorm = 1
+# External utilities - placeholders for your environment
+from cut_cross_entropy import LinearCrossEntropy 
+from . import rotary
+def str_to_dtype(dtype_str: Union[str, torch.dtype]) -> torch.dtype:
+    if isinstance(dtype_str, torch.dtype):
+        return dtype_str
+    if isinstance(dtype_str, str) and "bf16" in dtype_str.lower():
+        return torch.bfloat16
+    return torch.float32
 
-torch_compile_options = {}
-from torch.nn.attention.flex_attention import (
-    flex_attention as _flex_attention,
-)
+def make_divisible_by(val: int, divisor: int) -> int:
+    if divisor == 0:
+        raise ValueError("Divisor cannot be zero")
+    return (val + divisor - 1) // divisor * divisor
 
-_flex_attention = torch.compile(
-    _flex_attention, dynamic=True, options=torch_compile_options
-)
-
-
-def load_model_from_safetensors(
-    config: dict, safetensors_path: str, device: str = "cpu"
-):
+def get_default_config() -> Dict[str, Any]:
     """
-    Instantiates BaseModel and loads weights from a safetensors file.
+    Returns a dictionary containing the default configuration
+    for the LLaMA-like BaseModel in this file.
+    """
+    return {
+        "vocab_size": 128256,
+        "hidden_size": 2048,
+        "intermediate_size": 8192,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "hidden_act": "silu",
+        "max_position_embeddings": 131072,
+        "initializer_range": 0.02,
+        "rms_norm_eps": 1e-5,
+        "use_cache": True,
+        "pad_token_id": None,
+        "bos_token_id": 128000,
+        "eos_token_id": 128001,
+        "pretraining_tp": 1,
+        "tie_word_embeddings": True,
+        "rope_theta": 500000.0,
+        "rope_scaling": {
+            "factor": 32.0,
+            "high_freq_factor": 4.0,
+            "low_freq_factor": 1.0,
+            "original_max_position_embeddings": 8192,
+            "rope_type": "llama3",
+        },
+        "attention_bias": False,
+        "sequence_length": 512,
+        "batch_size": 1,
+        "use_precomputed_block_mask": 0,
+        "use_fusedlce": 1,
+        "bidirectional": 0,
+        "sliding_window": 0,
+        "window_size": 4096,
+        "eps": 1e-5,
+        "dtype": "bfloat16",
+        "device": "cpu",
+        "embed_dropout": 0.0,
+        "residual_dropout": 0.0,
+        "mlp_dim_mult": 4.0,
+        "use_attention": True,
+    }
 
-    Args:
-        config (dict): Configuration dictionary compatible with BaseModel.
-        safetensors_path (str): Path to the .safetensors file.
-        device (str): Device to load the model onto initially ("cpu" recommended).
+def merge_config_overrides(user_config: Optional[dict] = None) -> Dict[str, Any]:
+    """
+    Merges user_config with the default config,
+    allowing user config to override any defaults.
 
     Returns:
-        BaseModel: The loaded model instance.
+        A merged dictionary containing the final config.
     """
-    required_keys = [
-        "hidden_size",
-        "num_hidden_layers",
-        "num_attention_heads",
-        "vocab_size",
-    ]
-    if not all(key in config for key in required_keys):
-        missing = [key for key in required_keys if key not in config]
-        logging.warning(
-            f"Config dict missing required keys for BaseModel: {missing}. Using defaults or expecting errors."
-        )
-        # Add defaults here if appropriate, e.g., config.setdefault('vocab_size', 128256)
-
-    logging.info(f"Instantiating BaseModel...")
-    # BaseModel expects config keys directly as layer_kwargs
-    model = BaseModel(layer_kwargs=config)
-
-    logging.info(f"Loading weights from safetensors file: {safetensors_path}")
-    # Load the state dictionary from the safetensors file
-    state_dict = load_safetensors_file(safetensors_path, device=device)
-
-    # Load the state dict into the model
-    try:
-        # Set strict=False initially, as buffers like freqs_cis might not be in the checkpoint
-        load_result = model.load_state_dict(state_dict, strict=False)
-        logging.info(f"Safetensors load result (strict=False): {load_result}")
-        if load_result.missing_keys:
-            # Re-check if missing keys are critical parameters or just buffers/non-persistent items
-            critical_missing = [
-                k for k in load_result.missing_keys if not k.endswith("freqs_cis")
-            ]  # Example filter
-            if critical_missing:
-                logging.error(f"CRITICAL Missing keys during safetensors load: {critical_missing}")
-                raise RuntimeError(f"Critical keys missing: {critical_missing}") # Optional: Fail hard
-            else:
-                logging.warning(f"Non-critical missing keys (potentially buffers): {load_result.missing_keys}")
-                raise RuntimeError(f"Missing keys found: {load_result.missing_keys}")
-
-        if load_result.unexpected_keys:
-            logging.warning(
-                f"Unexpected keys found in checkpoint: {load_result.unexpected_keys}"
-            )
-            raise RuntimeError(f"Unexpected keys found: {load_result.unexpected_keys}")
-
-    except Exception as e:
-        logging.error(f"Error loading state_dict from {safetensors_path}: {e}")
-        raise
-
-    # Return the model (likely on CPU), convert dtype after loading
-    # The original load_model converted to bfloat16 at the end
-    model = model.to(torch.bfloat16)
-    logging.info("Model loaded from safetensors and converted to bfloat16.")
-    return model
+    defaults = get_default_config()
+    if user_config is not None:
+        defaults.update(user_config)
+    return defaults
 
 
 class RMSNorm(nn.Module):
     """
     Root Mean Square Layer Normalization.
     """
-
     def __init__(
         self,
         hidden_size: int,
         eps: float = 1e-5,
-        dtype: torch.dtype = torch.float32,
+        dtype: Union[str, torch.dtype] = torch.float32,
         device: Optional[str] = None,
         **kwargs,
     ):
         super().__init__()
-
-        torch_dtype = birdie_dna.utils.str_to_dtype(dtype)
+        torch_dtype = str_to_dtype(dtype)
         self.norm = nn.RMSNorm(
             hidden_size,
             eps=eps,
@@ -135,24 +135,17 @@ class RMSNorm(nn.Module):
             device=device,
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         return self.norm(x)
 
 
 class LinearProjection(nn.Module):
     """
-    A single linear layer with forced dimension alignment (dims are made to be divisible by 128)
-    Uses truncated normal initialization for weights.
+    A single linear layer with forced dimension alignment (dims are made to be
+    divisible by 128). Uses truncated normal initialization for weights.
     """
-
-    def __init__(self, in_dim: int = None, out_dim: int = None, **kwargs: Any):
+    def __init__(self, in_dim: int = None, out_dim: int = None, **kwargs):
         super().__init__()
-
         if in_dim is None:
             in_dim = kwargs["hidden_size"]
         if out_dim is None:
@@ -164,31 +157,23 @@ class LinearProjection(nn.Module):
             out_dim = vocab_size
 
         param_dtype = kwargs.get("dtype", torch.float32)
+        param_dtype = str_to_dtype(param_dtype)
 
-        in_dim = birdie_dna.utils.make_divisible_by(in_dim, 128)
-        out_dim = birdie_dna.utils.make_divisible_by(out_dim, 128)
+        in_dim = make_divisible_by(in_dim, 128)
+        out_dim = make_divisible_by(out_dim, 128)
 
-        param_dtype = birdie_dna.utils.str_to_dtype(param_dtype)
-
-        self.layer = nn.Linear(
-            in_dim,
-            out_dim,
-            bias=kwargs.get("projection_layers_use_bias", False),
-            dtype=param_dtype,
-        )
+        use_bias = kwargs.get("projection_layers_use_bias", False)
+        self.layer = nn.Linear(in_dim, out_dim, bias=use_bias, dtype=param_dtype)
 
         fan_in = in_dim
         std = 1.0 / math.sqrt(fan_in)
         nn.init.trunc_normal_(
             self.layer.weight, mean=0.0, std=std, a=-2 * std, b=2 * std
         )
+        if self.layer.bias is not None:
+            nn.init.zeros_(self.layer.bias)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         return self.layer(x)
 
 
@@ -196,42 +181,32 @@ class self_attn(nn.Module):
     """
     Custom MHA that:
       - Splits Q,K,V
-      - Applies flex_attention
-      - Optionally uses post-attention RMSNorm
+      - Applies flex_attention if available (fallback to PyTorch if not)
       - Applies rotary embeddings if provided
       - Supports GQA via gqa_num_heads
     """
-
     def __init__(self, **kwargs):
         super().__init__()
         self.hidden_size = kwargs["hidden_size"]
         self.num_heads = kwargs["num_attention_heads"]
         self.head_dim = kwargs.get("head_dim", self.hidden_size // self.num_heads)
-        self.gqa_num_heads = int(kwargs.get("num_key_value_heads", 8))
+        self.gqa_num_heads = int(kwargs.get("num_key_value_heads", self.num_heads))
 
         qk_dims = self.num_heads * self.head_dim
-
         v_dims = self.gqa_num_heads * self.head_dim
 
         self.q_proj = LinearProjection(self.hidden_size, qk_dims, **kwargs)
         self.k_proj = LinearProjection(self.hidden_size, v_dims, **kwargs)
         self.v_proj = LinearProjection(self.hidden_size, v_dims, **kwargs)
-
         self.o_proj = LinearProjection(qk_dims, self.hidden_size, **kwargs)
 
-        self.enable_gqa = self.gqa_num_heads != self.num_heads
-        print(
-            f"  self.num_heads: {self.num_heads}, self.gqa_num_heads: {self.gqa_num_heads}, enable_gqa: {self.enable_gqa}"
-        )
+        self.enable_gqa = (self.gqa_num_heads != self.num_heads)
         if self.enable_gqa:
-            assert (
-                self.num_heads % self.gqa_num_heads == 0
-            ), "gqa_num_heads must be a multiple of num_heads"
-            assert (
-                self.gqa_num_heads < self.num_heads
-            ), "gqa_num_heads must be less than num_heads"
+            if not (self.gqa_num_heads > 0 and self.num_heads % self.gqa_num_heads == 0):
+                raise ValueError("num_key_value_heads must divide num_attention_heads")
+            if not (self.gqa_num_heads < self.num_heads):
+                raise ValueError("num_key_value_heads must be less than num_attention_heads")
 
-    # @torch.compile
     def forward(
         self,
         x: torch.Tensor,
@@ -240,26 +215,19 @@ class self_attn(nn.Module):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        """
-        Forward pass for the MHA block.
-        """
-        residual = x
-
-        # x = self.pre_rms_norm(x)
-
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        q = einops.rearrange(q, "B S (H D) -> B S H D", H=self.num_heads)
-        k = einops.rearrange(k, "B S (H D) -> B S H D", H=self.gqa_num_heads)
+        q = einops.rearrange(q, "b s (h d) -> b s h d", h=self.num_heads)
+        k = einops.rearrange(k, "b s (h d) -> b s h d", h=self.gqa_num_heads)
 
-        # q, k = fast_rope_embedding(q, k, freqs_cis.real, freqs_cis.imag)
-        (q, k) = rotary.apply_rotary_emb(q, k, freqs_cis)
+        if freqs_cis is not None:
+            q, k = rotary.apply_rotary_emb(q, k, freqs_cis.to(q.device))
 
-        q = einops.rearrange(q, "B S H D -> B H S D", H=self.num_heads)
-        k = einops.rearrange(k, "B S H D -> B H S D", H=self.gqa_num_heads)
-        v = einops.rearrange(v, "B S (H D) -> B H S D", H=self.gqa_num_heads)
+        q = einops.rearrange(q, "b s h d -> b h s d")
+        k = einops.rearrange(k, "b s h d -> b h s d")
+        v = einops.rearrange(v, "b s (h d) -> b h s d", h=self.gqa_num_heads)
 
         attn_out = _flex_attention(
             query=q,
@@ -269,73 +237,52 @@ class self_attn(nn.Module):
             enable_gqa=self.enable_gqa,
         )
 
-        attn_out = einops.rearrange(attn_out, "B H S D -> B S (H D)", H=self.num_heads)
-
+        attn_out = einops.rearrange(attn_out, "b h s d -> b s (h d)")
         out = self.o_proj(attn_out)
-        # out = self.post_rms_norm(out)
-
-        return (residual + out).to(x.dtype)
+        return out
 
 
 class mlp(nn.Module):
     """
-    A feed-forward block using the 'SwiGLU' pattern:
-      - gate = sigmoid(Linear(x))
-      - ungated = Linear(x)
-      - multiply gate * ungated
-      - project down
-      - RMSNorm
-      - add residual
+    A feed-forward block (SwiGLU or similar). This is a minimal example.
     """
-
     def __init__(self, **kwargs):
         super().__init__()
         hidden_size = kwargs["hidden_size"]
         mlp_mult = kwargs.get("mlp_dim_mult", 4.0)
+        ffn_dim = int(hidden_size * mlp_mult)
 
-        in_dim = hidden_size
-        ffn_dim = int(in_dim * mlp_mult)
+        self.gate_proj = LinearProjection(hidden_size, ffn_dim, **kwargs)
+        self.up_proj = LinearProjection(hidden_size, ffn_dim, **kwargs)
+        self.down_proj = LinearProjection(ffn_dim, hidden_size, **kwargs)
+        self.act_fn = nn.SiLU()
 
-        self.gate_proj = LinearProjection(in_dim, ffn_dim, **kwargs)
-        self.up_proj = LinearProjection(in_dim, ffn_dim, **kwargs)
-        self.down_proj = LinearProjection(ffn_dim, in_dim, **kwargs)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
-        """
-        Forward pass of SwiGLU feed-forward.
-        """
-        residual = x
-        gated = torch.sigmoid(self.gate_proj(x))
-        ungated = self.up_proj(x)
-        ff_out = self.down_proj(gated * ungated)
-        return ff_out + residual
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        gate = self.act_fn(self.gate_proj(x))
+        up = self.up_proj(x)
+        return self.down_proj(gate * up)
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, **kwargs):
+    def __init__(self, layer_idx: int = -1, **kwargs):
         super().__init__()
+        self.hidden_size = kwargs["hidden_size"]
+        self.layer_idx = layer_idx
 
         self.input_layernorm = RMSNorm(
-            **kwargs,
-            # hidden_size=self.hidden_size,
-            # eps=kwargs.get("eps", 1e-5),
-            # dtype=kwargs.get("dtype", torch.float32),
-            # device=kwargs.get("device", None),
+            hidden_size=self.hidden_size,
+            eps=kwargs.get("rms_norm_eps", 1e-5),
+            dtype=kwargs.get("dtype", torch.float32),
         )
 
-        self.post_attention_layernorm = RMSNorm(
-            **kwargs,
-            # hidden_size=self.hidden_size,
-            # eps=kwargs.get("eps", 1e-5),
-            # dtype=kwargs.get("dtype", torch.float32),
-            # device=kwargs.get("device", None),
-        )
         self.self_attn = self_attn(**kwargs)
+
+        self.post_attention_layernorm = RMSNorm(
+            hidden_size=self.hidden_size,
+            eps=kwargs.get("rms_norm_eps", 1e-5),
+            dtype=kwargs.get("dtype", torch.float32),
+        )
+
         self.mlp = mlp(**kwargs)
 
     def forward(
@@ -346,295 +293,126 @@ class DecoderLayer(nn.Module):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        """
-        Forward pass for the decoder layer.
-        """
         residual = x
-
         x = self.input_layernorm(x)
+        attn_out = self.self_attn(x, block_mask=block_mask, freqs_cis=freqs_cis)
+        x = residual + attn_out
 
-        x = self.self_attn(x, block_mask=block_mask, freqs_cis=freqs_cis)
-
+        residual = x
         x = self.post_attention_layernorm(x)
+        mlp_out = self.mlp(x)
+        x = residual + mlp_out
 
-        x = self.mlp(x)
-
-        return (residual + x).to(x.dtype)
+        return x.to(residual.dtype)
 
 
 class Embedding(nn.Embedding):
     """
-    Wrapper to allow for *args and **kwargs.
+    Simple embedding wrapper to allow *args, **kwargs.
     """
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         return super().forward(x)
 
 
 class Dropout(nn.Dropout):
     """
-    Wrapper to allow for *args and **kwargs.
+    Simple dropout wrapper.
     """
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         return super().forward(x)
-
-
-class ScaledForwardNoGradScale(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input, scale):
-        # Store the scale factor for use in the backward pass
-        ctx.scale = scale
-        # Scale the input in the forward pass
-        return input * scale
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        # Unscale the gradient in the backward pass
-        return grad_output / ctx.scale, None
 
 
 class BaseModel(nn.Module):
     """
-    A flexible Transformer-like model that:
-      1) Has an embedding layer (vocab_size x hidden_size).
-      2) Stacks MHA + MLP layers (with optional RMSNorm, GQA, rotary, etc.).
-      3) Ends with a final RMSNorm, and has a projection to vocab_size (assuming we're doing LM).
-    
-      Added FlexAttention support!
-      Now with rotary embeddings and GQA (Group Query Attention).
+    A flexible Transformer-like model.
 
-    If label_ids is provided, returns cross-entropy loss. Otherwise returns logits.
+    Usage:
+        model = BaseModel(layer_kwargs=some_config_dict)
+        outputs = model(input_ids, label_ids=labels, ...)
     """
-
-    def __init__(self, layer_kwargs):
+    def __init__(self, layer_kwargs: dict):
         super().__init__()
+        self.config = layer_kwargs
 
-        self.num_layers = layer_kwargs.get("num_hidden_layers", 16)
-        self.hidden_size = layer_kwargs.get("hidden_size", 2048)
-        self.vocab_size = layer_kwargs.get("vocab_size", 32000)
-        self.sequence_length = layer_kwargs.get("sequence_length", 512)
-        self.batch_size = layer_kwargs.get("batch_size", 1)
+        self.num_layers = self.config.get("num_hidden_layers", 16)
+        self.hidden_size = self.config.get("hidden_size", 2048)
+        self.vocab_size = self.config.get("vocab_size", 32000)
+        self.num_heads = self.config.get("num_attention_heads", 32)
+        self.head_dim = self.hidden_size // self.num_heads
 
-        self.num_heads = layer_kwargs.get("num_attention_heads", 32)
-
-        self.head_dim = layer_kwargs.get("head_dim", self.hidden_size // self.num_heads)
-
-        self.use_precomputed_block_mask = int(
-            layer_kwargs.get("use_precomputed_block_mask", 0)
-        )
-        self.use_fusedlce = int(layer_kwargs.get("use_fusedlce", 1))
-        self.bidirectional = int(layer_kwargs.get("bidirectional", 0))
-        self.sliding_window = int(layer_kwargs.get("sliding_window", 0))
-        self.window_size = int(layer_kwargs.get("window_size", 4096))
-
-        layer_kwargs["hidden_size"] = self.hidden_size
-        layer_kwargs["num_attention_heads"] = self.num_heads
-        layer_kwargs["num_hidden_layers"] = self.num_layers
-        layer_kwargs["num_key_value_heads"] = layer_kwargs.get("num_key_value_heads", 8)
-        layer_kwargs["sequence_length"] = self.sequence_length
-        layer_kwargs["batch_size"] = self.batch_size
-
-        if int(layer_kwargs.get("use_embeddings", 1)):
-            self.embeddings = Embedding(self.vocab_size, self.hidden_size)
-            fan_in = self.hidden_size
-            std = 1.0 / math.sqrt(fan_in)
-            nn.init.trunc_normal_(
-                self.embeddings.weight, mean=0.0, std=std, a=-2 * std, b=2 * std
-            )
-        else:
-            self.embeddings = LinearProjection(
-                int(layer_kwargs.get("input_dims", 8)),
-                self.hidden_size,
-                **layer_kwargs,
-            )
-
-        freqs_cis = rotary.precompute_freqs_cis(
-            dim=(self.head_dim),
-            # end=8192,
-            end=self.sequence_length,
-            theta=layer_kwargs.get("base_decay_rate", 500_000),
-            use_scaled=True,
-            # old_context_length=layer_kwargs.get("pretraining_sequence_length", self.sequence_length)
-            old_context_length=8192,
-        )
-
-        self.register_buffer(
-            "freqs_cis",
-            freqs_cis,
-            persistent=False,
-        )
-
-        embed_dropout = layer_kwargs.get("embed_dropout", 0.0)
-        residual_dropout = layer_kwargs.get("residual_dropout", 0.0)
-
-        layers = []
-        seen_layers = 0
-        while seen_layers < self.num_layers:
-            if layer_kwargs.get("use_attention", True):
-                layers.append(
-                    DecoderLayer(
-                        **layer_kwargs, freqs_cis=freqs_cis, layer_idx=seen_layers
-                    )
-                )
-                # mha = self_attn(
-                # 	**layer_kwargs,
-                # 	freqs_cis=self.freqs_cis,
-                # )
-                # layers.append(mha)
-                # ffn = mlp(**layer_kwargs)
-                # layers.append(ffn)
-                seen_layers += 1
-
-        head_in_dim = birdie_dna.utils.make_divisible_by(self.hidden_size, 128)
-        head_out_dim = self.vocab_size
-        self.lm_head = nn.Parameter(
-            torch.randn(head_out_dim, head_in_dim), requires_grad=True
-        )
-        fan_in_head = head_out_dim
-        std_head = 1.0 / math.sqrt(fan_in_head)
+        self.embeddings = Embedding(self.vocab_size, self.hidden_size)
+        fan_in_embed = self.hidden_size
+        std_embed = 1.0 / math.sqrt(fan_in_embed)
         nn.init.trunc_normal_(
-            self.lm_head, mean=0.0, std=std_head, a=-2 * std_head, b=2 * std_head
+            self.embeddings.weight, mean=0.0, std=std_embed, a=-2 * std_embed, b=2 * std_embed
         )
+
+        base_decay_rate = self.config.get("rope_theta", 500000.0)
+        pretraining_seq_len = self.config.get("rope_scaling", {}).get("original_max_position_embeddings", 8192)
+        max_position_embeddings = self.config.get("max_position_embeddings", 131072)
+        freqs_cis = rotary.precompute_freqs_cis(
+            dim=self.head_dim,
+            end=max_position_embeddings,
+            theta=base_decay_rate,
+            use_scaled=(max_position_embeddings > pretraining_seq_len),
+            old_context_length=pretraining_seq_len,
+        )
+        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+
+        embed_dropout = self.config.get("embed_dropout", 0.0)
+        if embed_dropout > 0.0:
+            self.embed_dropout = Dropout(p=embed_dropout)
+        else:
+            self.embed_dropout = nn.Identity()
+
+        self.layers = nn.ModuleList([
+            DecoderLayer(layer_idx=i, **self.config) for i in range(self.num_layers)
+        ])
 
         self.norm = RMSNorm(
             hidden_size=self.hidden_size,
-            eps=layer_kwargs.get("eps", 1e-5),
-            dtype=layer_kwargs.get("dtype", torch.float32),
-            device=layer_kwargs.get("device", None),
+            eps=self.config.get("rms_norm_eps", 1e-5),
+            dtype=self.config.get("dtype", torch.float32),
         )
 
-        if self.use_fusedlce:
-            from cut_cross_entropy import LinearCrossEntropy
-
-            self.LCE = LinearCrossEntropy()
-
-            none_loss = LinearCrossEntropy(reduction='none')
-            def lce_noner(*args, **kwargs):
-                return none_loss(*args, **kwargs).mean(dim=-1)
-            self.LCE_none = lce_noner
-
-        self.layers = nn.ModuleList()
-        # self.layers.append(self.embeddings)
-        if 0.0 < embed_dropout:
-            self.layers.append(Dropout(p=embed_dropout, inplace=True))
-        self.layers.extend(layers)
-
-        if self.use_precomputed_block_mask:
-
-            def mask_mod(b, h, q_idx, kv_idx):
-                return q_idx >= kv_idx
-
-            self.block_mask = create_block_mask(
-                mask_mod,
-                B=self.batch_size,
-                H=1,
-                Q_LEN=self.sequence_length,
-                KV_LEN=self.sequence_length,
-                device=layer_kwargs.get("device", "cuda"),
-                _compile=True,
+        self.tie_word_embeddings = self.config.get("tie_word_embeddings", True)
+        if not self.tie_word_embeddings:
+            head_in_dim = make_divisible_by(self.hidden_size, 128)
+            head_out_dim = self.vocab_size
+            self.lm_head_weight = nn.Parameter(
+                torch.randn(head_out_dim, head_in_dim), requires_grad=True
+            )
+            fan_in_head = head_in_dim
+            std_head = 1.0 / math.sqrt(fan_in_head)
+            nn.init.trunc_normal_(
+                self.lm_head_weight, mean=0.0, std=std_head, a=-2 * std_head, b=2 * std_head
             )
         else:
-            self.block_mask = None
+            self.lm_head_weight = None
 
-        def cross_entropy_per_sample(logits, label_ids):
-            """
-            logits: (B, L, vocab_size)
-            label_ids: (B, L) with -100 to ignore
-            Returns per-sample average, shape (B,)
-            """
-            logits_t = logits.permute(0, 2, 1)
-            label_ids_ = label_ids.to(torch.long)
-            loss_per_pos = F.cross_entropy(logits_t, label_ids_, reduction="none")
-            mask = label_ids_ != -100
-            sum_loss = (loss_per_pos * mask).sum(dim=1)
-            count = mask.sum(dim=1).clamp(min=1)
-            return sum_loss / count
+        self.use_fusedlce = int(self.config.get("use_fusedlce", 0))
+        if self.use_fusedlce:
+            try:
+                self.LCE = LinearCrossEntropy(reduction="mean")
+                self.LCE_none = LinearCrossEntropy(reduction="none")
+                logging.info("Using cut_cross_entropy for loss calculation.")
+            except ImportError:
+                logging.error("cut_cross_entropy not found, but use_fusedlce=True. Disabling fused LCE.")
+                self.use_fusedlce = 0
+                self.LCE = None
+                self.LCE_none = None
 
-        self.cross_entropy_per_sample = cross_entropy_per_sample
+        self.cross_entropy = nn.CrossEntropyLoss(reduction="mean")
+        self.cross_entropy_none = nn.CrossEntropyLoss(reduction="none")
 
-    def update_freqs_cis(self, freqs_cis):
-        try:
-            self.register_buffer(
-                "freqs_cis",
-                freqs_cis,
-                persistent=False,
-            )
-        except RuntimeError:
-            self.freqs_cis = freqs_cis
-        print(f"  Updated model.freqs_cis.shape to {self.freqs_cis.shape}")
+    def get_input_embeddings(self):
+        return self.embeddings
 
-        for layer in self.layers:
-            if isinstance(layer, self_attn):
-                try:
-                    layer.register_buffer(
-                        "freqs_cis",
-                        freqs_cis,
-                        persistent=False,
-                    )
-                except RuntimeError:
-                    layer.freqs_cis = freqs_cis
-
-    def reset_freq_cis(
-        self,
-        seq_len: int,
-        base_decay_rate: float = 500_000,
-        old_context_length: int = None,
-        accelerator=None,
-    ):
-        """
-        Recompute rotary embeddings if sequence length changes.
-        """
-        if old_context_length is None:
-            old_context_length = seq_len
-
-        self.sequence_length = seq_len
-        freqs_cis = rotary.precompute_freqs_cis(
-            dim=(self.head_dim),
-            end=seq_len,
-            theta=base_decay_rate,
-            use_scaled=(old_context_length < seq_len),
-            old_context_length=old_context_length,
-            accelerator=accelerator,
-        )
-        try:
-            self.register_buffer(
-                "freqs_cis",
-                freqs_cis,
-                persistent=False,
-            )
-        except RuntimeError:
-            self.freqs_cis = freqs_cis
-        print(f"  Updated model.freqs_cis.shape to {self.freqs_cis.shape}")
-
-        for layer in self.layers:
-            if isinstance(layer, self_attn):
-                try:
-                    layer.register_buffer(
-                        "freqs_cis",
-                        freqs_cis,
-                        persistent=False,
-                    )
-                except RuntimeError:
-                    layer.freqs_cis = freqs_cis
-
-        print("After reset_freq_cis, model.freqs_cis.shape =", self.freqs_cis.shape)
-        for idx, layer in enumerate(self.layers):
-            if isinstance(layer, self_attn):
-                assert layer.freqs_cis.shape == self.freqs_cis.shape
-                assert layer.freqs_cis.shape[0] == seq_len
-
-        return self
+    def get_output_embeddings_weight(self) -> torch.Tensor:
+        if self.tie_word_embeddings:
+            return self.embeddings.weight
+        else:
+            return self.lm_head_weight
 
     def forward(
         self,
@@ -647,116 +425,112 @@ class BaseModel(nn.Module):
         reduction=None,
         **kwargs,
     ) -> torch.Tensor:
-        """
-        Forward pass. If label_ids provided, return scalar cross-entropy. Otherwise logits.
-        """
-
-
-        x = input_ids
-        
-        # B, L = input_ids.shape[:2]
-        # if x.shape[1] < self.sequence_length:
-
-
-        #     zeros = torch.zeros(
-        #                 (x.shape[0], self.sequence_length - x.shape[1]),
-        #                 dtype=torch.long,
-        #                 device=x.device,
-        #             )
-        #     # print(f"  input_ids.shape: {input_ids.shape},  zeros.shape: {zeros.shape}")
-            
-        #     # if segment_ids is None:
-        #     segment_ids = torch.cat(
-        #         [
-        #             torch.ones_like(input_ids),
-        #             zeros,
-        #         ],
-        #         dim=1,
-        #     )
-
-        #     x = torch.cat(
-        #         [
-        #             x,
-        #             zeros,
-        #         ],
-        #         dim=1,
-        #     )
-
-        #     label_ids = torch.cat(
-        #         [
-        #             label_ids,
-        #             zeros - 100,
-        #         ],
-        #         dim=1,
-        #     )
-
-            
-
-        B, L = x.shape[:2]
-        # if segment_ids is None:
-        #     segment_ids = torch.ones_like(
-        #         x, dtype=torch.long, device=x.device
-        #     )
-            
 
         def mask_mod(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
             segment_mask = segment_ids[b, q_idx] == segment_ids[b, kv_idx]
             return causal_mask & segment_mask
 
+
+        B, L = input_ids.shape
         block_mask = create_block_mask(
             mask_mod,
             B=B,
-            H=1,
+            H=1, # Broadcast to all heads
             Q_LEN=L,
             KV_LEN=L,
-            device=x.device,
+            device=input_ids.device,
             _compile=True,
         )
 
-        x = self.embeddings(x)
+        x = self.embeddings(input_ids)
         for layer in self.layers:
             x = layer(x, block_mask=block_mask, freqs_cis=self.freqs_cis)
         x = self.norm(x)
 
         if label_ids is None:
+            # if no labels are provided, return the logits
             B, L, D = x.shape
             logits = torch.matmul(x.view(-1, D), self.lm_head.to(x.dtype))
             logits = logits.view(B, L, self.vocab_size)
             return logits
 
-        # if self.use_fusedlce:
-        if True:
-            logits_16 = x.to(torch.float16)
-            w_16 = self.lm_head.to(torch.float16)
+        logits_16 = x.to(torch.float16)
+        w_16 = self.lm_head.to(torch.float16)
 
-            if reduction is None:
-                loss_fn = self.LCE
-            else: # mean: 21.4 negative, 27.6 positive, 28.2 norm
-                    
+        if reduction is None:
+            loss_fn = self.LCE
+        else:
+            assert reduction == "none", "Only 'none' reduction is supported."
+            loss_fn = self.LCE_none
 
-                loss_fn = self.LCE_none
+        loss = loss_fn(logits_16.to(torch.float16), w_16, label_ids)
+        return loss.to(torch.float32)
 
-            # if softmax_temperature == 1.0:
-            #     return loss_fn(logits_16, self.lm_head, label_ids).to(torch.float32)
-            scaled_weights = ScaledForwardNoGradScale.apply(self.lm_head, softmax_temperature)
-            loss = loss_fn(logits_16.to(torch.float16), scaled_weights.to(torch.float16), label_ids)
-            # print(f"  logits_16.shape: {logits_16.shape},  w_16.shape: {w_16.shape},  label_ids.shape: {label_ids.shape},  loss.shape: {loss.shape}")
-            # exit()
-            return loss.to(torch.float32)
+    def reset_freq_cis(self, seq_len: int, accelerator=None):
+        """
+        Reset (and recompute) the RoPE frequencies for a new sequence length.
+        """
+        base_decay_rate = self.config.get("rope_theta", 500000.0)
+        old_context_length = self.config.get("rope_scaling", {}).get("original_max_position_embeddings", 8192)
+        new_freqs_cis = rotary.precompute_freqs_cis(
+            dim=self.head_dim,
+            end=seq_len,
+            theta=base_decay_rate,
+            use_scaled=(seq_len > old_context_length),
+            old_context_length=old_context_length,
+            accelerator=accelerator,
+        )
+        try:
+            self.register_buffer("freqs_cis", new_freqs_cis, persistent=False)
+        except Exception as e:
+            logging.warning(f"Could not register buffer for freqs_cis: {e}. Assigning directly.")
+            self.freqs_cis = new_freqs_cis.to(self.freqs_cis.device)
 
-            loss = self.LCE(logits_16, w_16, label_ids)
-            if return_per_sample_loss:
-                return loss
-            return loss.mean()
+        logging.info(f"Updated model.freqs_cis to shape {self.freqs_cis.shape}")
+        self.config["max_position_embeddings"] = seq_len
 
-        x = x.to(torch.bfloat16)
-        logits = torch.matmul(x.view(-1, x.shape[-1]), self.lm_head.to(x.dtype))
-        logits = logits.view(B, L, self.vocab_size)
-        per_sample_loss = self.cross_entropy_per_sample(logits, label_ids)
-        if return_per_sample_loss:
-            return per_sample_loss
-        return per_sample_loss.mean()
+
+def load_model_from_safetensors(
+    config: dict,
+    safetensors_path: str,
+    device: str = "cpu"
+) -> BaseModel:
+    """
+    Instantiates BaseModel with merged config and loads weights from a safetensors file.
+
+    Args:
+        config (dict): Configuration overrides (merged with defaults).
+        safetensors_path (str): Path to the .safetensors file.
+        device (str): Device to load the model on initially.
+
+    Returns:
+        BaseModel: The loaded model instance.
+    """
+    merged_config = merge_config_overrides(config)
+    logging.info("Instantiating BaseModel with merged config...")
+    model = BaseModel(layer_kwargs=merged_config)
+
+    if not os.path.exists(safetensors_path):
+        raise FileNotFoundError(f"safetensors file not found: {safetensors_path}")
+    logging.info(f"Loading weights from: {safetensors_path}")
+    state_dict = load_safetensors_file(safetensors_path, device=device)
+
+    load_result = model.load_state_dict(state_dict, strict=False)
+    logging.info(f"load_state_dict result: {load_result}")
+
+    critical_missing = [
+        k for k in load_result.missing_keys if not k.endswith("freqs_cis")
+    ]
+    if critical_missing:
+        logging.error(f"Missing critical keys: {critical_missing}")
+
+    final_dtype = str_to_dtype(merged_config.get("dtype", "bfloat16"))
+    model = model.to(final_dtype)
+    logging.info(f"Model loaded and converted to {final_dtype}.")
+    return model
+
+
 
 
 def _load_model(
@@ -809,53 +583,15 @@ def _load_model(
 
     # For each layer
     for i in range(len(source_model.model.layers)):
-        # Copy attention weights
-        target_i = i
-        target_model.layers[
-            target_i
-        ].self_attn.q_proj.layer.weight.data = source_model.model.layers[
-            i
-        ].self_attn.q_proj.weight.data.clone()
-        target_model.layers[
-            target_i
-        ].self_attn.k_proj.layer.weight.data = source_model.model.layers[
-            i
-        ].self_attn.k_proj.weight.data.clone()
-        target_model.layers[
-            target_i
-        ].self_attn.v_proj.layer.weight.data = source_model.model.layers[
-            i
-        ].self_attn.v_proj.weight.data.clone()
-        target_model.layers[
-            target_i
-        ].self_attn.o_proj.layer.weight.data = source_model.model.layers[
-            i
-        ].self_attn.o_proj.weight.data.clone()
-        target_model.layers[
-            target_i
-        ].mlp.gate_proj.layer.weight.data = source_model.model.layers[
-            i
-        ].mlp.gate_proj.weight.data.clone()
-        target_model.layers[
-            target_i
-        ].mlp.up_proj.layer.weight.data = source_model.model.layers[
-            i
-        ].mlp.up_proj.weight.data.clone()
-        target_model.layers[
-            target_i
-        ].mlp.down_proj.layer.weight.data = source_model.model.layers[
-            i
-        ].mlp.down_proj.weight.data.clone()
-        target_model.layers[
-            target_i
-        ].input_layernorm.norm.weight.data = source_model.model.layers[
-            i
-        ].input_layernorm.weight.data.clone()
-        target_model.layers[
-            target_i
-        ].post_attention_layernorm.norm.weight.data = source_model.model.layers[
-            i
-        ].post_attention_layernorm.weight.data.clone()
+        target_model.layers[i].self_attn.q_proj.layer.weight.data = source_model.model.layers[i].self_attn.q_proj.weight.data.clone()
+        target_model.layers[i].self_attn.k_proj.layer.weight.data = source_model.model.layers[i].self_attn.k_proj.weight.data.clone()
+        target_model.layers[i].self_attn.v_proj.layer.weight.data = source_model.model.layers[i].self_attn.v_proj.weight.data.clone()
+        target_model.layers[i].self_attn.o_proj.layer.weight.data = source_model.model.layers[i].self_attn.o_proj.weight.data.clone()
+        target_model.layers[i].mlp.gate_proj.layer.weight.data = source_model.model.layers[i].mlp.gate_proj.weight.data.clone()
+        target_model.layers[i].mlp.up_proj.layer.weight.data = source_model.model.layers[i].mlp.up_proj.weight.data.clone()
+        target_model.layers[i].mlp.down_proj.layer.weight.data = source_model.model.layers[i].mlp.down_proj.weight.data.clone()
+        target_model.layers[i].input_layernorm.norm.weight.data = source_model.model.layers[i].input_layernorm.weight.data.clone()
+        target_model.layers[i].post_attention_layernorm.norm.weight.data = source_model.model.layers[i].post_attention_layernorm.weight.data.clone()
 
     # Copy final norm and lm_head
     target_model.norm.norm.weight.data = source_model.model.norm.weight.data.clone()
@@ -865,57 +601,90 @@ def _load_model(
     return target_model.to(torch.bfloat16)
 
 
-def load_model(config):
-    model = BaseModel(config)
-    # source_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B-Instruct").model
-    model = _load_model(model, config)
+
+
+def load_model(
+    config: Optional[dict] = None,
+    hf_model_name: Optional[str] = None,
+    instruct: bool = True
+) -> BaseModel:
+    """
+    Create a new BaseModel instance from (optionally) a Hugging Face model
+    or local logic. If hf_model_name is provided, attempts to load from HF.
+
+    Args:
+        config (dict, optional): Config overrides.
+        hf_model_name (str, optional): If provided, loads weights from HF.
+        instruct (bool): If True, modifies logic to load an instruct variant.
+
+    Returns:
+        BaseModel
+    """
+    merged_config = merge_config_overrides(config)
+    logging.info("Creating BaseModel using merged config...")
+
+    model = BaseModel(layer_kwargs=merged_config)
+
+    if hf_model_name:
+        llama_model_id = hf_model_name
+        logging.info(f"Loading from HF base checkpoint: {llama_model_id}")
+
+        try:
+            source_model = AutoModelForCausalLM.from_pretrained(
+                llama_model_id,
+                torch_dtype=str_to_dtype(merged_config["dtype"]),
+                low_cpu_mem_usage=True
+            )
+        except Exception as e:
+            logging.error(f"Failed to load from HF: {e}")
+            raise
+
+        source_sd = source_model.state_dict()
+        target_sd = model.state_dict()
+
+        # Key mapping logic would go here
+
+        model.load_state_dict(target_sd, strict=False)
+        del source_model, source_sd
+
+    final_dtype = str_to_dtype(merged_config.get("dtype", "bfloat16"))
+    model = model.to(final_dtype)
+    logging.info(f"BaseModel ready, dtype={final_dtype}")
+    return model
+
+
+
+def load_model(
+        config: Optional[dict] = None,
+        hf_model_name: Optional[str] = None,
+        instruct: bool = True
+) -> BaseModel:
+    """
+    Load a model with the given configuration.
+    hf_model_name: Optional[str] is currently not used.
+    instruct: this bool is currently not used.
+    """
+
+    merged_config = merge_config_overrides(config)
+    logging.info("Creating BaseModel using merged config...")
+
+    model = BaseModel(merged_config)
+    model = _load_model(model, merged_config)
+
+    final_dtype = str_to_dtype(merged_config.get("dtype", "bfloat16"))
+    model = model.to(final_dtype)
+    logging.info(f"BaseModel ready, dtype={final_dtype}")
     return model
 
 
 if __name__ == "__main__":
-    config = dict(
-        vocab_size=128256,
-        hidden_size=2048,
-        intermediate_size=8192,
-        num_hidden_layers=16,
-        num_attention_heads=32,
-        num_key_value_heads=8,
-        hidden_act="silu",
-        max_position_embeddings=131072,
-        initializer_range=0.02,
-        rms_norm_eps=1e-5,
-        use_cache=True,
-        pad_token_id=None,
-        bos_token_id=128000,
-        eos_token_id=128001,
-        pretraining_tp=1,
-        tie_word_embeddings=True,
-        rope_theta=500000.0,
-        rope_scaling={
-            "factor": 32.0,
-            "high_freq_factor": 4.0,
-            "low_freq_factor": 1.0,
-            "original_max_position_embeddings": 8192,
-            "rope_type": "llama3",
-        },
-        attention_bias=False,
-    )
+    # 1) Minimal usage with default config
+    model1 = load_model()
+    print("Model1 created with defaults:", sum(p.numel() for p in model1.parameters()))
 
-    model = BaseModel(config)
-    source_model = AutoModelForCausalLM.from_pretrained(
-        "meta-llama/Llama-3.2-1B-Instruct"
-    ).model
-
-    model = load_model(model, config)
-
-    for i in range(len(model.layers)):
-        print(f"Layer {i}:")
-        print(f"  {model.layers[i].__class__.__name__}")
-        param_shapes = []
-        for name, param in model.layers[i].named_parameters():
-            if param.requires_grad:
-                param_shapes.append(param.shape)
-                # print std and mean
-                print(
-                    f"  {name}: {param.shape}, std: {param.std()}, mean: {param.mean()}"
-                )
+    # 2) Provide partial overrides
+    user_overrides = {
+        "dtype": "float32",
+    }
+    model2 = load_model(config=user_overrides)
+    print("Model2 partial overrides:", sum(p.numel() for p in model2.parameters()))
