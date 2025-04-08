@@ -94,6 +94,13 @@ pip install -e .
 This project uses HuggingFace Accelerate for handling distributed training and device placement.
 
 ```bash
+# Minimal Example
+# This will download the model weights and run a minimal training example.
+# It also shows prints out a processed batch by the the data processor, which adds necessary auxiliary information for the Flex Attention block sparsity mask used.
+python src/minimal_training_example.py
+```
+
+```bash
 
 # 1 GPU on a local machine
 python train_wrapper.py \
@@ -105,6 +112,9 @@ python train_wrapper.py \
 	--output_dir "./training_logs" \
 	--steps_between_evals 200
 
+```
+
+```bash
 # 4 GPUs on a local machine
 accelerate launch --num_gpus 4 train_wrapper.py \
 	--dataset_name "teknium/OpenHermes-2.5" \
@@ -115,6 +125,9 @@ accelerate launch --num_gpus 4 train_wrapper.py \
 	--output_dir "./training_logs" \
 	--steps_between_evals 200
 
+```
+
+```bash
 # Multi-node setup
 accelerate launch --num_processes 8 --num_machines 2 --machine_rank 0 train_wrapper.py \
 	--dataset_name "teknium/OpenHermes-2.5" \

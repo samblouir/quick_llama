@@ -8,11 +8,11 @@ This example shows:
 import numpy as np
 import torch
 import torch.nn as nn
-from accelerate import Accelerator
 from models.model_arch import load_model
 from packer_batcher import Batcher
 import config as cfg
 import data_utils
+import packer_batcher
 
 def main():
     # 1) Minimal config with overrides
@@ -31,7 +31,7 @@ def main():
 
     # 2) Load a small LLaMA-like model
     model = load_model(config=config)
-    print("Model parameter count:", sum(p.numel() for p in model.parameters()))
+    print(f"Model parameter count: {sum(p.numel() for p in model.parameters())}")
 
     # 3) "Tokenize" two strings. Here we hardcode numeric IDs for brevity.
     #    label_ids are the same as input_ids for a standard LM.
@@ -46,6 +46,11 @@ def main():
     # Retrieve the packed batch dictionary
     # shape -> [batch_size=1, seq_len=12]
     batch = batcher.pop()
+
+    print(f"*" * 60,)
+    # Debugging function to check alignment
+    packer_batcher.debug_alignments(packer_batcher)
+    print(f"*" * 60,)
 
     # 5) Convert from numpy arrays to torch Tensors and reshape to [batch_size, seq_len].
     #    We'll keep batch_size=1 from the Batcher in this example.
