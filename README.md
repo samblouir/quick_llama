@@ -81,7 +81,7 @@ source .venv/bin/activate # On Linux/macOS
 # .venv\Scripts\activate # On Windows
 
 # Clone the repository
-git clone [https://github.com/samblouir/quick_llama](https://github.com/samblouir/quick_llama)
+git clone https://github.com/samblouir/quick_llama
 cd quick_llama
 
 # Install the base package in editable mode
@@ -105,7 +105,7 @@ python src/minimal_training_example.py
 # 1 GPU on a local machine
 python train_wrapper.py \
 	--dataset_name "teknium/OpenHermes-2.5" \
-	--batch_size_per_device 8 \
+	--batch_size_per_device 32 \
 	--gradient_accumulation_steps 4 \
 	--num_epochs 1 \
 	--lr 5e-5 \

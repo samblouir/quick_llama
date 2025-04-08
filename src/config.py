@@ -25,7 +25,6 @@ def get_default_config():
         "adam_epsilon": 1e-8,
         "num_warmup_steps_ratio": 0.05,
         "clip_grad_norm": 1.0,
-        "softmax_temperature": 1.0,
         "steps_between_evals": 1024,
         "save_limit": 3,
         "output_dir": DEFAULT_OUTPUT_DIR,
@@ -33,7 +32,7 @@ def get_default_config():
         "mixed_precision": "bf16",
         "communication_timeout_seconds": 3000,
         "use_eval_cache": True,
-        "test_set_path": None, # Allow overriding the default test set path
+        "test_set_path": None,
     }
 
 def parse_arguments():
@@ -44,7 +43,8 @@ def parse_arguments():
     parser.add_argument("--dataset_name", type=str, help=f"Dataset name from Hugging Face Hub (default: {DEFAULT_DATASET_NAME})")
     parser.add_argument("--sequence_length", type=int, help="Maximum sequence length.")
     parser.add_argument("--num_epochs", type=int, help="Number of training epochs.")
-    parser.add_argument("--batch_size_per_device", type=int, help="Batch size per GPU.")
+    parser.add_argument("--global_batch_size", type=int, help="Global batch size.")
+    # parser.add_argument("--batch_size_per_device", type=int, help="Batch size per GPU.")
     parser.add_argument("--gradient_accumulation_steps", type=int, help="Number of steps to accumulate gradients over.")
     parser.add_argument("--lr", type=float, help="Learning rate.")
     parser.add_argument("--weight_decay", type=float, help="Weight decay.")
@@ -52,11 +52,13 @@ def parse_arguments():
     parser.add_argument("--output_dir", type=str, help="Directory to save logs and checkpoints.")
     parser.add_argument("--seed", type=int, help="Random seed.")
     parser.add_argument("--mixed_precision", type=str, choices=["no", "fp16", "bf16"], help="Mixed precision type.")
-    parser.add_argument("--test_set_path", type=str, help="Path to the multiple-choice test set JSON file.")
     parser.add_argument("--no_eval_cache", action="store_false", dest="use_eval_cache", help="Disable caching of evaluation generations.")
 
     args = parser.parse_args()
     overrides = {k: v for k, v in vars(args).items() if v is not None}
+    
+	# Convert batch size to per-device if global batch size is provided
+    
     return overrides
 
 def setup_accelerator(config):

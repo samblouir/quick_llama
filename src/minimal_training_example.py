@@ -23,7 +23,7 @@ def main():
 
     # Load the tokenizer and dataset
     config = {
-        "dtype": "bfloat16",
+        "dtype": "bfloat16", # parameter and compute dtype
         "sequence_length": 1024,
         "batch_size": 1,
         "minimum_sequence_length": 0,
@@ -39,12 +39,14 @@ def main():
     label_world = data_utils.tokenize_text("World")
     
     # 4) Use packer_batcher to pack them into a single batch
-    #    We'll define a small sequence_length for demonstration.
+    #    We'll define a small sequence_length for this demonstration.
     batcher = Batcher(config=config)
     batcher.add(input_ids=input_hello, label_ids=label_world)   # Add first example
 
     # Retrieve the packed batch dictionary
-    # shape -> [batch_size=1, seq_len=12]
+    # Normally we'd check to see if batcher is ready to pop since it can't hold any more samples.
+    ## status = batcher.is_ready()
+    # but for this example we'll just pop the batch.
     batch = batcher.pop()
 
     print(f"*" * 60,)

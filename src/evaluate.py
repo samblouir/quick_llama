@@ -7,7 +7,7 @@ from accelerate.logging import get_logger
 from accelerate import Accelerator
 
 import cache # Your existing module
-from data_utils import get_tokenizer, initialize_tokenizer # For chat formatting if needed
+from data_utils import get_tokenizer
 
 log = get_logger(__name__)
 
@@ -31,9 +31,6 @@ def run_validation_loss(model, accelerator: Accelerator, validation_batches):
     with torch.no_grad(): # Disable gradient calculations
         for batch in validation_batches: # Assuming validation_batches yields dicts of tensors
             if not batch: continue # Skip empty batches
-
-            # Add softmax temperature if model expects it (use default 1.0 for eval)
-            batch['softmax_temperature'] = torch.tensor([1.0], device=accelerator.device, dtype=torch.float16) # Or model's default dtype
 
             # Forward pass to get loss
             # Assuming model returns loss when return_loss=True or similar
