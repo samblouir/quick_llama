@@ -10,35 +10,21 @@ import os
 import transformers
 from transformers import TextIteratorStreamer
 
-# import threading
 from threading import Thread
 
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
 
-# set pad
-# The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
-# Setting `pad_token_id` to `eos_token_id`:128001 for open-end generation.
 tokenizer.pad_token_id = tokenizer.eos_token_id
 
-
-
-
 class ScaledForwardNoGradScale(torch.autograd.Function):
+
 	@staticmethod
-	def forward(ctx, input, scale):
-		# Store the scale factor for use in the backward pass
-		ctx.scale = scale
-		# Scale the input in the forward pass
-		return input * scale
+	def forward(ctx, input):
+		return input
 
 	@staticmethod
 	def backward(ctx, grad_output):
-		# Unscale the gradient in the backward pass
-		return grad_output / ctx.scale, None
-
-
-
-
+		return grad_output, None
 
 class CausalLlama(LlamaForCausalLM):
 	def __init__(self, config, use_fusedlce=False, **config_kwargs):
@@ -56,28 +42,20 @@ class CausalLlama(LlamaForCausalLM):
 	):
 		kwargs.pop('labels', None)
 
-		# for batch_idx,(key,value) in enumerate(kwargs.items()):
-		# 	accelerator.print(f"  batch[{key}].shape: {value.shape}")
-
 		outputs = self.model(
 			input_ids=input_ids,
 			**kwargs
 		)
 		hidden_states = outputs.last_hidden_state
 		h = hidden_states
-		
+
 		if label_ids is not None:
 			if not  self.use_fusedlce:
 				raise ValueError("  Not implemented! use_fusedlce is False, but label_ids is not None")
-			# logits = self.lm_head(hidden_states)
-			# if self.softmax_temperature != 1.0:
-			# 	logits = logits * self.softmax_temperature
-			# loss = torch.nn.functional.cross_entropy(logits.reshape((-1, logits.shape[-1])), label_ids.reshape((-1,)).to(torch.long), reduction="mean",)
-			
+
 			if self.softmax_temperature == 1.0:
 				return self.LCE(h.to(torch.float16), self.lm_head.weight.to(torch.float16), label_ids).to(torch.float32)
-			scaled_weights = ScaledForwardNoGradScale.apply(self.lm_head.weight, self.softmax_temperature)
-			loss = self.LCE(h.to(torch.float16), scaled_weights.to(torch.float16), label_ids)
+			loss = self.LCE(h.to(torch.float16), self.lm_head.weight.to(torch.float16), label_ids)
 			return loss.to(torch.float32)
 		else:
 			logits = self.lm_head(hidden_states)
@@ -88,9 +66,6 @@ class CausalLlama(LlamaForCausalLM):
 				hidden_states=outputs.hidden_states,
 				attentions=outputs.attentions,
 			)
-		
-	
-
 
 	def chat(self, input_str, deterministic=True, **kwargs):
 
@@ -104,7 +79,7 @@ class CausalLlama(LlamaForCausalLM):
 
 		input_ids = tokenizer.apply_chat_template(conversation, return_tensors="pt", add_generation_prompt=True)
 		new_length = (len(input_ids) + 256)
-		# align to 512
+
 		new_length = (new_length // 512 + 1) * 512
 
 		if deterministic:
@@ -127,17 +102,15 @@ class CausalLlama(LlamaForCausalLM):
 			pad_token_id=tokenizer.eos_token_id,
 			**generation_kwargs,
 		)
-		
+
 		input_ids = torch.tensor(input_ids, dtype=torch.long).to(self.device)
 		iid_shape = input_ids.shape
 		if len(iid_shape) == 1:
 			input_ids = input_ids.unsqueeze(0)
 
-		# Use TextIteratorStreamer to stream tokens
 		streamer = TextIteratorStreamer(tokenizer, skip_special_tokens=False, clean_up_tokenization_spaces=False)
 		generation_kwargs = dict(input_ids=input_ids, streamer=streamer, generation_config=generation_config, tokenizer=tokenizer,)
 
-		# Generate tokens and stream them
 		thread = Thread(target=self.generate, kwargs=generation_kwargs)
 		thread.start()
 
@@ -153,18 +126,15 @@ class CausalLlama(LlamaForCausalLM):
 			print(new_text, end='', flush=True)
 			rv.append(new_text)
 
-
 		thread.join()
 		ret_str = ''.join(rv)
 		ret_str = ret_str.rsplit('<|end_header_id|>', 1)[-1].rsplit('<|eot_id|>', 1)[0].strip()
 		return ret_str
-		
-
 
 	def chat_raw(self, input_str, deterministic=True, **kwargs,):
 		input_ids = tokenizer.encode(input_str)
 		new_length = (len(input_ids) + 256)
-		# align to 512
+
 		new_length = (new_length // 512 + 1) * 512
 
 		if deterministic:
@@ -186,17 +156,15 @@ class CausalLlama(LlamaForCausalLM):
 			repetition_penalty=1.1,
 			**generation_kwargs,
 		)
-		
+
 		input_ids = torch.tensor(input_ids, dtype=torch.long).to(self.device)
 		iid_shape = input_ids.shape
 		if len(iid_shape) == 1:
 			input_ids = input_ids.unsqueeze(0)
 
-		# Use TextIteratorStreamer to stream tokens
 		streamer = TextIteratorStreamer(tokenizer, skip_special_tokens=False, clean_up_tokenization_spaces=False)
 		generation_kwargs = dict(input_ids=input_ids, streamer=streamer, generation_config=generation_config, tokenizer=tokenizer,)
 
-		# Generate tokens and stream them
 		thread = Thread(target=self.generate, kwargs=generation_kwargs)
 		thread.start()
 
@@ -206,11 +174,10 @@ class CausalLlama(LlamaForCausalLM):
 			rv.append(new_text)
 		thread.join()
 		return ''.join(rv)
-		
-		
+
 	def chat_from_input_ids(self, input_ids, **kwargs):
 		new_length = (len(input_ids)+256)
-		# align to 512
+
 		new_length = (new_length // 512 + 1) * 512
 		import transformers
 		generation_config = transformers.generation.configuration_utils.GenerationConfig(
@@ -225,8 +192,6 @@ class CausalLlama(LlamaForCausalLM):
 		decoded = decoded[0]
 		return decoded
 
-
-		
 def load_model(config,):
 
 	instruct = config.get('instruct', False)
@@ -265,27 +230,22 @@ def load_model(config,):
 
 	target_model = CausalLlama(config=_config, use_fusedlce=True, **config)
 
-	# Copy embeddings
 	target_model.model.embed_tokens.weight.data = source_model.model.embed_tokens.weight.data.clone()
 
-	# For each layer
 	for i in range(len(source_model.model.layers)):
-		# Copy attention weights
+
 		target_model.model.layers[i].self_attn.q_proj.weight.data = source_model.model.layers[i].self_attn.q_proj.weight.data.clone()
 		target_model.model.layers[i].self_attn.k_proj.weight.data = source_model.model.layers[i].self_attn.k_proj.weight.data.clone()
 		target_model.model.layers[i].self_attn.v_proj.weight.data = source_model.model.layers[i].self_attn.v_proj.weight.data.clone()
 		target_model.model.layers[i].self_attn.o_proj.weight.data = source_model.model.layers[i].self_attn.o_proj.weight.data.clone()
 
-		# Copy MLP weights
 		target_model.model.layers[i].mlp.gate_proj.weight.data = source_model.model.layers[i].mlp.gate_proj.weight.data.clone()
 		target_model.model.layers[i].mlp.up_proj.weight.data = source_model.model.layers[i].mlp.up_proj.weight.data.clone()
 		target_model.model.layers[i].mlp.down_proj.weight.data = source_model.model.layers[i].mlp.down_proj.weight.data.clone()
 
-		# Copy Layer Norms
 		target_model.model.layers[i].input_layernorm.weight.data = source_model.model.layers[i].input_layernorm.weight.data.clone()
 		target_model.model.layers[i].post_attention_layernorm.weight.data = source_model.model.layers[i].post_attention_layernorm.weight.data.clone()
 
-	# Copy final norm and lm_head
 	target_model.model.norm.weight.data = source_model.model.norm.weight.data.clone()
 	target_model.lm_head.weight.data = source_model.lm_head.weight.data.clone()
 
@@ -323,9 +283,6 @@ def start_yapping(model=None):
 
 	while True:
 
-		# print(f"\n" * 3, end='',)
-		# print(f"#" * 60,)
-
 		pretty_print_history(history)
 
 		if do_once:
@@ -337,25 +294,13 @@ def start_yapping(model=None):
 
 		history.append({"role": "user", "content": message})
 
-		# print(f"*" * 60,)
-		# decoded = model.chat_raw(message)
 		pretty_print_history(history)
 		decoded = model.chat(history)
 		history.append({"role": "assistant", "content": decoded})
 
-		# print(f"{decoded}")
-		# print(f"#" * 60,)
-
-
-
-
 def main():
-	# source_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
 
-	# generate text
 	tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
-
-
 
 	accelerator = accelerate.Accelerator()
 
@@ -364,12 +309,5 @@ def main():
 
 	start_yapping(model)
 
-
 if __name__ == "__main__":
     start_yapping()
-
-
-
-
-
-
