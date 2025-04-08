@@ -1,2 +1,4 @@
 src/old/
 src/pipelines/
+__pycache__/
+*.py[cod]
