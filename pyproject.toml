@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quick_llama"
-version = "0.1.0"
+version = "0.1.3"
 description = "An efficient and flexible distributed training codebase that loads in Llama 3.2 1B."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -58,8 +58,7 @@ triton = [
     'triton>=3.1 ; platform_system=="Linux"',
 ]
 flash = [
-    # FlashAttention requires NVIDIA GPU and Linux
-    'flash_attn==2.6.3 ; platform_system=="Linux"',
+    'flash_attn==2.6.3',
 ]
 optim = [
     # Installs all performance optimizations (triton, flash)

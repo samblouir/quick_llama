@@ -4,11 +4,12 @@ BASE MODEL
 -------------------------------------
 Supports:
   - Rotary embeddings
-  - GQA (Group Query Attention) (set (gqa_num_heads < num_heads) and (gqa_num_heads % num_heads == 0))
+  - GQA (Group Query Attention)
   - RMSNorm
-  - (Optional) fused cross-entropy that does not materialize logits
+  - (Optional) fused cross-entropy
   - Segment-aware block mask
   - FAN-in param inits
+  - (Optional) Triton-based rotary embeddings (enable with use_triton_rope=True)
 ===============================================================================
 """
 
@@ -19,27 +20,34 @@ from typing import Optional, Any, Union, Dict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import einops
 
 try:
     from torch.nn.attention.flex_attention import create_block_mask
     from torch.nn.attention.flex_attention import flex_attention as _raw_flex_attention
 
-    # Example compile options if needed:
     _flex_attention = torch.compile(_raw_flex_attention, dynamic=True, options={})
     FLEX_ATTENTION_AVAILABLE = True
 except ImportError:
     FLEX_ATTENTION_AVAILABLE = False
-    logging.warning("flex_attention not found; fallback or error will occur if used.")
+    logging.warning("flex_attention not found; fallback or error may occur if used.")
 
 from safetensors.torch import load_file as load_safetensors_file
 from transformers import AutoModelForCausalLM
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-# External utilities - placeholders for your environment
-from cut_cross_entropy import LinearCrossEntropy 
+from cut_cross_entropy import LinearCrossEntropy
 from . import rotary
+
+TRITON_ROPE_AVAILABLE = False
+try:
+    from .triton_rotary import fast_rope_embedding
+
+    TRITON_ROPE_AVAILABLE = True
+except ImportError:
+    pass
+
+
 def str_to_dtype(dtype_str: Union[str, torch.dtype]) -> torch.dtype:
     if isinstance(dtype_str, torch.dtype):
         return dtype_str
@@ -47,16 +55,14 @@ def str_to_dtype(dtype_str: Union[str, torch.dtype]) -> torch.dtype:
         return torch.bfloat16
     return torch.float32
 
+
 def make_divisible_by(val: int, divisor: int) -> int:
     if divisor == 0:
         raise ValueError("Divisor cannot be zero")
     return (val + divisor - 1) // divisor * divisor
 
+
 def get_default_config() -> Dict[str, Any]:
-    """
-    Returns a dictionary containing the default configuration
-    for the LLaMA-like BaseModel in this file.
-    """
     return {
         "vocab_size": 128256,
         "hidden_size": 2048,
@@ -97,16 +103,11 @@ def get_default_config() -> Dict[str, Any]:
         "residual_dropout": 0.0,
         "mlp_dim_mult": 4.0,
         "use_attention": True,
+        "use_triton_rope": False,
     }
 
-def merge_config_overrides(user_config: Optional[dict] = None) -> Dict[str, Any]:
-    """
-    Merges user_config with the default config,
-    allowing user config to override any defaults.
 
-    Returns:
-        A merged dictionary containing the final config.
-    """
+def merge_config_overrides(user_config: Optional[dict] = None) -> Dict[str, Any]:
     defaults = get_default_config()
     if user_config is not None:
         defaults.update(user_config)
@@ -114,9 +115,6 @@ def merge_config_overrides(user_config: Optional[dict] = None) -> Dict[str, Any]
 
 
 class RMSNorm(nn.Module):
-    """
-    Root Mean Square Layer Normalization.
-    """
     def __init__(
         self,
         hidden_size: int,
@@ -140,10 +138,6 @@ class RMSNorm(nn.Module):
 
 
 class LinearProjection(nn.Module):
-    """
-    A single linear layer with forced dimension alignment (dims are made to be
-    divisible by 128). Uses truncated normal initialization for weights.
-    """
     def __init__(self, in_dim: int = None, out_dim: int = None, **kwargs):
         super().__init__()
         if in_dim is None:
@@ -156,9 +150,7 @@ class LinearProjection(nn.Module):
         if is_vocab_head:
             out_dim = vocab_size
 
-        param_dtype = kwargs.get("dtype", torch.float32)
-        param_dtype = str_to_dtype(param_dtype)
-
+        param_dtype = str_to_dtype(kwargs.get("dtype", torch.float32))
         in_dim = make_divisible_by(in_dim, 128)
         out_dim = make_divisible_by(out_dim, 128)
 
@@ -178,13 +170,6 @@ class LinearProjection(nn.Module):
 
 
 class self_attn(nn.Module):
-    """
-    Custom MHA that:
-      - Splits Q,K,V
-      - Applies flex_attention if available (fallback to PyTorch if not)
-      - Applies rotary embeddings if provided
-      - Supports GQA via gqa_num_heads
-    """
     def __init__(self, **kwargs):
         super().__init__()
         self.hidden_size = kwargs["hidden_size"]
@@ -199,53 +184,56 @@ class self_attn(nn.Module):
         self.k_proj = LinearProjection(self.hidden_size, v_dims, **kwargs)
         self.v_proj = LinearProjection(self.hidden_size, v_dims, **kwargs)
         self.o_proj = LinearProjection(qk_dims, self.hidden_size, **kwargs)
-
-        self.enable_gqa = (self.gqa_num_heads != self.num_heads)
+        self.enable_gqa = self.gqa_num_heads != self.num_heads
         if self.enable_gqa:
-            if not (self.gqa_num_heads > 0 and self.num_heads % self.gqa_num_heads == 0):
+            if not (
+                self.gqa_num_heads > 0 and self.num_heads % self.gqa_num_heads == 0
+            ):
                 raise ValueError("num_key_value_heads must divide num_attention_heads")
             if not (self.gqa_num_heads < self.num_heads):
-                raise ValueError("num_key_value_heads must be less than num_attention_heads")
+                raise ValueError("num_key_value_heads must be < num_attention_heads")
+
+        self.use_triton_rope = bool(kwargs.get("use_triton_rope", False))
 
     def forward(
-        self,
-        x: torch.Tensor,
-        block_mask=None,
-        freqs_cis=None,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-
-        q = einops.rearrange(q, "b s (h d) -> b s h d", h=self.num_heads)
-        k = einops.rearrange(k, "b s (h d) -> b s h d", h=self.gqa_num_heads)
+        self, x: torch.Tensor, block_mask=None, freqs_cis=None, *args, **kwargs
+    ):
+        q = einops.rearrange(self.q_proj(x), "b s (h d) -> b s h d", h=self.num_heads)
+        k = einops.rearrange(
+            self.k_proj(x), "b s (h d) -> b s h d", h=self.gqa_num_heads
+        )
+        v = einops.rearrange(
+            self.v_proj(x), "b s (h d) -> b s h d", h=self.gqa_num_heads
+        )
 
         if freqs_cis is not None:
-            q, k = rotary.apply_rotary_emb(q, k, freqs_cis.to(q.device))
+            if (
+                self.use_triton_rope
+                and TRITON_ROPE_AVAILABLE
+                and (self.gqa_num_heads == self.num_heads)
+            ):
+                cos_part = freqs_cis.real[: q.shape[1], : q.shape[-1]]
+                sin_part = freqs_cis.imag[: q.shape[1], : q.shape[-1]]
+                q_f32 = q.to(torch.float32)
+                k_f32 = k.to(torch.float32)
+                q_out, k_out = fast_rope_embedding(q_f32, k_f32, cos_part, sin_part)
+                q = q_out.to(q.dtype)
+                k = k_out.to(k.dtype)
+            else:
+                q, k = rotary.apply_rotary_emb(q, k, freqs_cis.to(q.device))
 
         q = einops.rearrange(q, "b s h d -> b h s d")
         k = einops.rearrange(k, "b s h d -> b h s d")
-        v = einops.rearrange(v, "b s (h d) -> b h s d", h=self.gqa_num_heads)
+        v = einops.rearrange(v, "b s h d -> b h s d", h=self.gqa_num_heads)
 
         attn_out = _flex_attention(
-            query=q,
-            key=k,
-            value=v,
-            block_mask=block_mask,
-            enable_gqa=self.enable_gqa,
+            query=q, key=k, value=v, block_mask=block_mask, enable_gqa=self.enable_gqa
         )
-
         attn_out = einops.rearrange(attn_out, "b h s d -> b s (h d)")
-        out = self.o_proj(attn_out)
-        return out
+        return self.o_proj(attn_out)
 
 
 class mlp(nn.Module):
-    """
-    A feed-forward block (SwiGLU or similar). This is a minimal example.
-    """
     def __init__(self, **kwargs):
         super().__init__()
         hidden_size = kwargs["hidden_size"]
@@ -276,64 +264,39 @@ class DecoderLayer(nn.Module):
         )
 
         self.self_attn = self_attn(**kwargs)
-
         self.post_attention_layernorm = RMSNorm(
             hidden_size=self.hidden_size,
             eps=kwargs.get("rms_norm_eps", 1e-5),
             dtype=kwargs.get("dtype", torch.float32),
         )
-
         self.mlp = mlp(**kwargs)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        block_mask=None,
-        freqs_cis=None,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
+        self, x: torch.Tensor, block_mask=None, freqs_cis=None, *args, **kwargs
+    ):
         residual = x
         x = self.input_layernorm(x)
-        attn_out = self.self_attn(x, block_mask=block_mask, freqs_cis=freqs_cis)
-        x = residual + attn_out
-
+        x = residual + self.self_attn(x, block_mask=block_mask, freqs_cis=freqs_cis)
         residual = x
         x = self.post_attention_layernorm(x)
-        mlp_out = self.mlp(x)
-        x = residual + mlp_out
-
+        x = residual + self.mlp(x)
         return x.to(residual.dtype)
 
 
 class Embedding(nn.Embedding):
-    """
-    Simple embedding wrapper to allow *args, **kwargs.
-    """
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         return super().forward(x)
 
 
 class Dropout(nn.Dropout):
-    """
-    Simple dropout wrapper.
-    """
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         return super().forward(x)
 
 
 class BaseModel(nn.Module):
-    """
-    A flexible Transformer-like model.
-
-    Usage:
-        model = BaseModel(layer_kwargs=some_config_dict)
-        outputs = model(input_ids, label_ids=labels, ...)
-    """
     def __init__(self, layer_kwargs: dict):
         super().__init__()
         self.config = layer_kwargs
-
         self.num_layers = self.config.get("num_hidden_layers", 16)
         self.hidden_size = self.config.get("hidden_size", 2048)
         self.vocab_size = self.config.get("vocab_size", 32000)
@@ -344,11 +307,17 @@ class BaseModel(nn.Module):
         fan_in_embed = self.hidden_size
         std_embed = 1.0 / math.sqrt(fan_in_embed)
         nn.init.trunc_normal_(
-            self.embeddings.weight, mean=0.0, std=std_embed, a=-2 * std_embed, b=2 * std_embed
+            self.embeddings.weight,
+            mean=0.0,
+            std=std_embed,
+            a=-2 * std_embed,
+            b=2 * std_embed,
         )
 
         base_decay_rate = self.config.get("rope_theta", 500000.0)
-        pretraining_seq_len = self.config.get("rope_scaling", {}).get("original_max_position_embeddings", 8192)
+        pretraining_seq_len = self.config.get("rope_scaling", {}).get(
+            "original_max_position_embeddings", 8192
+        )
         max_position_embeddings = self.config.get("max_position_embeddings", 131072)
         freqs_cis = rotary.precompute_freqs_cis(
             dim=self.head_dim,
@@ -360,15 +329,13 @@ class BaseModel(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
         embed_dropout = self.config.get("embed_dropout", 0.0)
-        if embed_dropout > 0.0:
-            self.embed_dropout = Dropout(p=embed_dropout)
-        else:
-            self.embed_dropout = nn.Identity()
+        self.embed_dropout = (
+            nn.Dropout(p=embed_dropout) if embed_dropout > 0 else nn.Identity()
+        )
 
-        self.layers = nn.ModuleList([
-            DecoderLayer(layer_idx=i, **self.config) for i in range(self.num_layers)
-        ])
-
+        self.layers = nn.ModuleList(
+            [DecoderLayer(layer_idx=i, **self.config) for i in range(self.num_layers)]
+        )
         self.norm = RMSNorm(
             hidden_size=self.hidden_size,
             eps=self.config.get("rms_norm_eps", 1e-5),
@@ -385,7 +352,11 @@ class BaseModel(nn.Module):
             fan_in_head = head_in_dim
             std_head = 1.0 / math.sqrt(fan_in_head)
             nn.init.trunc_normal_(
-                self.lm_head_weight, mean=0.0, std=std_head, a=-2 * std_head, b=2 * std_head
+                self.lm_head_weight,
+                mean=0.0,
+                std=std_head,
+                a=-2 * std_head,
+                b=2 * std_head,
             )
         else:
             self.lm_head_weight = None
@@ -397,7 +368,7 @@ class BaseModel(nn.Module):
                 self.LCE_none = LinearCrossEntropy(reduction="none")
                 logging.info("Using cut_cross_entropy for loss calculation.")
             except ImportError:
-                logging.error("cut_cross_entropy not found, but use_fusedlce=True. Disabling fused LCE.")
+                logging.error("cut_cross_entropy not found. Disabling fused LCE.")
                 self.use_fusedlce = 0
                 self.LCE = None
                 self.LCE_none = None
@@ -408,11 +379,15 @@ class BaseModel(nn.Module):
     def get_input_embeddings(self):
         return self.embeddings
 
-    def get_output_embeddings_weight(self) -> torch.Tensor:
+    @property
+    def lm_head(self):
         if self.tie_word_embeddings:
             return self.embeddings.weight
         else:
             return self.lm_head_weight
+
+    def get_output_embeddings_weight(self) -> torch.Tensor:
+        return self.lm_head
 
     def forward(
         self,
@@ -425,18 +400,16 @@ class BaseModel(nn.Module):
         reduction=None,
         **kwargs,
     ) -> torch.Tensor:
-
         def mask_mod(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
             segment_mask = segment_ids[b, q_idx] == segment_ids[b, kv_idx]
             return causal_mask & segment_mask
 
-
         B, L = input_ids.shape
         block_mask = create_block_mask(
             mask_mod,
             B=B,
-            H=1, # Broadcast to all heads
+            H=1,
             Q_LEN=L,
             KV_LEN=L,
             device=input_ids.device,
@@ -449,30 +422,26 @@ class BaseModel(nn.Module):
         x = self.norm(x)
 
         if label_ids is None:
-            # if no labels are provided, return the logits
             B, L, D = x.shape
             logits = torch.matmul(x.view(-1, D), self.lm_head.to(x.dtype))
-            logits = logits.view(B, L, self.vocab_size)
-            return logits
+            return logits.view(B, L, self.vocab_size)
 
         logits_16 = x.to(torch.float16)
         w_16 = self.lm_head.to(torch.float16)
-
         if reduction is None:
             loss_fn = self.LCE
         else:
             assert reduction == "none", "Only 'none' reduction is supported."
             loss_fn = self.LCE_none
 
-        loss = loss_fn(logits_16.to(torch.float16), w_16, label_ids)
+        loss = loss_fn(logits_16, w_16, label_ids)
         return loss.to(torch.float32)
 
     def reset_freq_cis(self, seq_len: int, accelerator=None):
-        """
-        Reset (and recompute) the RoPE frequencies for a new sequence length.
-        """
         base_decay_rate = self.config.get("rope_theta", 500000.0)
-        old_context_length = self.config.get("rope_scaling", {}).get("original_max_position_embeddings", 8192)
+        old_context_length = self.config.get("rope_scaling", {}).get(
+            "original_max_position_embeddings", 8192
+        )
         new_freqs_cis = rotary.precompute_freqs_cis(
             dim=self.head_dim,
             end=seq_len,
@@ -484,7 +453,7 @@ class BaseModel(nn.Module):
         try:
             self.register_buffer("freqs_cis", new_freqs_cis, persistent=False)
         except Exception as e:
-            logging.warning(f"Could not register buffer for freqs_cis: {e}. Assigning directly.")
+            logging.warning(f"Could not register buffer for freqs_cis: {e}")
             self.freqs_cis = new_freqs_cis.to(self.freqs_cis.device)
 
         logging.info(f"Updated model.freqs_cis to shape {self.freqs_cis.shape}")
@@ -492,21 +461,8 @@ class BaseModel(nn.Module):
 
 
 def load_model_from_safetensors(
-    config: dict,
-    safetensors_path: str,
-    device: str = "cpu"
+    config: dict, safetensors_path: str, device: str = "cpu"
 ) -> BaseModel:
-    """
-    Instantiates BaseModel with merged config and loads weights from a safetensors file.
-
-    Args:
-        config (dict): Configuration overrides (merged with defaults).
-        safetensors_path (str): Path to the .safetensors file.
-        device (str): Device to load the model on initially.
-
-    Returns:
-        BaseModel: The loaded model instance.
-    """
     merged_config = merge_config_overrides(config)
     logging.info("Instantiating BaseModel with merged config...")
     model = BaseModel(layer_kwargs=merged_config)
@@ -515,15 +471,12 @@ def load_model_from_safetensors(
         raise FileNotFoundError(f"safetensors file not found: {safetensors_path}")
     logging.info(f"Loading weights from: {safetensors_path}")
     state_dict = load_safetensors_file(safetensors_path, device=device)
-
     load_result = model.load_state_dict(state_dict, strict=False)
     logging.info(f"load_state_dict result: {load_result}")
 
-    critical_missing = [
-        k for k in load_result.missing_keys if not k.endswith("freqs_cis")
-    ]
-    if critical_missing:
-        logging.error(f"Missing critical keys: {critical_missing}")
+    missing_crit = [k for k in load_result.missing_keys if not k.endswith("freqs_cis")]
+    if missing_crit:
+        logging.error(f"Missing critical keys: {missing_crit}")
 
     final_dtype = str_to_dtype(merged_config.get("dtype", "bfloat16"))
     model = model.to(final_dtype)
@@ -531,14 +484,8 @@ def load_model_from_safetensors(
     return model
 
 
-
-
-def _load_model(
-    target_model,
-    config,
-):
+def _load_model(target_model, config):
     instruct = config.get("instruct", False)
-
     if instruct:
         source_model = AutoModelForCausalLM.from_pretrained(
             "meta-llama/Llama-3.2-1B-Instruct"
@@ -546,7 +493,7 @@ def _load_model(
     else:
         source_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
 
-    _config = LlamaConfig(
+    _ = LlamaConfig(
         vocab_size=128256,
         hidden_size=2048,
         intermediate_size=8192,
@@ -574,26 +521,56 @@ def _load_model(
         attention_bias=False,
     )
 
-    # target_model = CausalLlama(config=_config, use_fusedlce=True, **config)
-
-    # Copy embeddings
     target_model.embeddings.weight.data = (
         source_model.model.embed_tokens.weight.data.clone()
     )
-
-    # For each layer
     for i in range(len(source_model.model.layers)):
-        target_model.layers[i].self_attn.q_proj.layer.weight.data = source_model.model.layers[i].self_attn.q_proj.weight.data.clone()
-        target_model.layers[i].self_attn.k_proj.layer.weight.data = source_model.model.layers[i].self_attn.k_proj.weight.data.clone()
-        target_model.layers[i].self_attn.v_proj.layer.weight.data = source_model.model.layers[i].self_attn.v_proj.weight.data.clone()
-        target_model.layers[i].self_attn.o_proj.layer.weight.data = source_model.model.layers[i].self_attn.o_proj.weight.data.clone()
-        target_model.layers[i].mlp.gate_proj.layer.weight.data = source_model.model.layers[i].mlp.gate_proj.weight.data.clone()
-        target_model.layers[i].mlp.up_proj.layer.weight.data = source_model.model.layers[i].mlp.up_proj.weight.data.clone()
-        target_model.layers[i].mlp.down_proj.layer.weight.data = source_model.model.layers[i].mlp.down_proj.weight.data.clone()
-        target_model.layers[i].input_layernorm.norm.weight.data = source_model.model.layers[i].input_layernorm.weight.data.clone()
-        target_model.layers[i].post_attention_layernorm.norm.weight.data = source_model.model.layers[i].post_attention_layernorm.weight.data.clone()
+        target_model.layers[
+            i
+        ].self_attn.q_proj.layer.weight.data = source_model.model.layers[
+            i
+        ].self_attn.q_proj.weight.data.clone()
+        target_model.layers[
+            i
+        ].self_attn.k_proj.layer.weight.data = source_model.model.layers[
+            i
+        ].self_attn.k_proj.weight.data.clone()
+        target_model.layers[
+            i
+        ].self_attn.v_proj.layer.weight.data = source_model.model.layers[
+            i
+        ].self_attn.v_proj.weight.data.clone()
+        target_model.layers[
+            i
+        ].self_attn.o_proj.layer.weight.data = source_model.model.layers[
+            i
+        ].self_attn.o_proj.weight.data.clone()
+        target_model.layers[
+            i
+        ].mlp.gate_proj.layer.weight.data = source_model.model.layers[
+            i
+        ].mlp.gate_proj.weight.data.clone()
+        target_model.layers[
+            i
+        ].mlp.up_proj.layer.weight.data = source_model.model.layers[
+            i
+        ].mlp.up_proj.weight.data.clone()
+        target_model.layers[
+            i
+        ].mlp.down_proj.layer.weight.data = source_model.model.layers[
+            i
+        ].mlp.down_proj.weight.data.clone()
+        target_model.layers[
+            i
+        ].input_layernorm.norm.weight.data = source_model.model.layers[
+            i
+        ].input_layernorm.weight.data.clone()
+        target_model.layers[
+            i
+        ].post_attention_layernorm.norm.weight.data = source_model.model.layers[
+            i
+        ].post_attention_layernorm.weight.data.clone()
 
-    # Copy final norm and lm_head
     target_model.norm.norm.weight.data = source_model.model.norm.weight.data.clone()
     target_model.lm_head.data = source_model.lm_head.weight.data.clone()
 
@@ -601,76 +578,15 @@ def _load_model(
     return target_model.to(torch.bfloat16)
 
 
-
-
 def load_model(
     config: Optional[dict] = None,
     hf_model_name: Optional[str] = None,
-    instruct: bool = True
+    instruct: bool = True,
 ) -> BaseModel:
-    """
-    Create a new BaseModel instance from (optionally) a Hugging Face model
-    or local logic. If hf_model_name is provided, attempts to load from HF.
-
-    Args:
-        config (dict, optional): Config overrides.
-        hf_model_name (str, optional): If provided, loads weights from HF.
-        instruct (bool): If True, modifies logic to load an instruct variant.
-
-    Returns:
-        BaseModel
-    """
     merged_config = merge_config_overrides(config)
     logging.info("Creating BaseModel using merged config...")
-
-    model = BaseModel(layer_kwargs=merged_config)
-
-    if hf_model_name:
-        llama_model_id = hf_model_name
-        logging.info(f"Loading from HF base checkpoint: {llama_model_id}")
-
-        try:
-            source_model = AutoModelForCausalLM.from_pretrained(
-                llama_model_id,
-                torch_dtype=str_to_dtype(merged_config["dtype"]),
-                low_cpu_mem_usage=True
-            )
-        except Exception as e:
-            logging.error(f"Failed to load from HF: {e}")
-            raise
-
-        source_sd = source_model.state_dict()
-        target_sd = model.state_dict()
-
-        # Key mapping logic would go here
-
-        model.load_state_dict(target_sd, strict=False)
-        del source_model, source_sd
-
-    final_dtype = str_to_dtype(merged_config.get("dtype", "bfloat16"))
-    model = model.to(final_dtype)
-    logging.info(f"BaseModel ready, dtype={final_dtype}")
-    return model
-
-
-
-def load_model(
-        config: Optional[dict] = None,
-        hf_model_name: Optional[str] = None,
-        instruct: bool = True
-) -> BaseModel:
-    """
-    Load a model with the given configuration.
-    hf_model_name: Optional[str] is currently not used.
-    instruct: this bool is currently not used.
-    """
-
-    merged_config = merge_config_overrides(config)
-    logging.info("Creating BaseModel using merged config...")
-
     model = BaseModel(merged_config)
     model = _load_model(model, merged_config)
-
     final_dtype = str_to_dtype(merged_config.get("dtype", "bfloat16"))
     model = model.to(final_dtype)
     logging.info(f"BaseModel ready, dtype={final_dtype}")
@@ -678,13 +594,13 @@ def load_model(
 
 
 if __name__ == "__main__":
-    # 1) Minimal usage with default config
-    model1 = load_model()
-    print("Model1 created with defaults:", sum(p.numel() for p in model1.parameters()))
-
-    # 2) Provide partial overrides
-    user_overrides = {
-        "dtype": "float32",
-    }
-    model2 = load_model(config=user_overrides)
-    print("Model2 partial overrides:", sum(p.numel() for p in model2.parameters()))
+    m1 = load_model()
+    print(
+        "Model1 with default config param count:",
+        sum(p.numel() for p in m1.parameters()),
+    )
+    overrides = {"dtype": "float32"}
+    m2 = load_model(config=overrides)
+    print(
+        "Model2 partial overrides param count:", sum(p.numel() for p in m2.parameters())
+    )
