@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "quick_llama"
 version = "0.1.0"
-description = "An efficient and flexible Transformer that loads in Llama 3.2 1B."
+description = "An efficient and flexible distributed training codebase that loads in Llama 3.2 1B."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 authors = [
@@ -15,9 +15,10 @@ maintainers = [
     { name = "samblouir", email = "sblouir@gmu.edu" },
 ]
 requires-python = ">=3.8"
+
+# Core dependencies installed by default
 dependencies = [
     "torch>=2.5",
-    "triton>=3.0",
     "transformers>=4.40",
     "huggingface-hub>=0.20",
     "datasets>=2.10.0",
@@ -28,13 +29,54 @@ dependencies = [
     "einops>=0.7.0",
     "lm-eval>=0.4",
     "cut-cross-entropy @ git+https://github.com/unslothai/cut-cross-entropy",
-	"flash_attn==2.6.3",
 ]
+
+# Optional dependencies (extras) - install via `pip install quick_llama[extra_name]`
+[project.optional-dependencies]
+triton = [
+    # On macOS, Triton build attempt needs certifi and Git source
+    'certifi; platform_system=="Darwin"',
+    'triton @ git+https://github.com/triton-lang/triton.git#subdirectory=python; platform_system=="Darwin"',
+    # On Linux, install from PyPI (requires CUDA)
+    'triton>=3.1; platform_system=="Linux"',
+]
+flash = [
+    # FlashAttention requires NVIDIA GPU and Linux
+    'flash_attn==2.6.3; platform_system=="Linux"',
+]
+optim = [
+    # Installs all performance optimizations (triton, flash)
+    "quick_llama[triton]",
+    "quick_llama[flash]",
+]
+dev = [
+    # Dependencies for development (testing, linting, formatting)
+    "pytest>=7.0",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+]
+utils = [
+    "psutil>=5.8.0",
+]
+tokenizers = [
+    "sentencepiece",
+    "protobuf",
+]
+all = [
+    # Installs all optional and development dependencies
+    "quick_llama[optim]",
+    "quick_llama[dev]",
+    "quick_llama[utils]",
+    "quick_llama[tokenizers]",
+]
+
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
@@ -49,19 +91,8 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/samblouir/quick_llama"
 Repository = "https://github.com/samblouir/quick_llama"
-Issues = "https://github.com/samblouir/quick_llama/issues"
+Issues = "https://github.com/samblouir/quick_llama"
 
 [tool.setuptools.packages.find]
+# Assumes package code is in 'src/' directory
 where = ["src"]
-
-[project.optional-dependencies]
-dev = [
-    "pytest",
-]
-utils = [
-    "psutil>=5.8.0",
-]
-tokenizers = [
-    "sentencepiece",
-    "protobuf",
-]
