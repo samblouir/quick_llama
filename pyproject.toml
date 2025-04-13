@@ -16,7 +16,7 @@ maintainers = [
 ]
 requires-python = ">=3.8"
 dependencies = [
-    "torch>=2.5cd",
+    "torch>=2.5",
     "triton>=3.1",
     "transformers>=4.40",
     "huggingface-hub>=0.20",
