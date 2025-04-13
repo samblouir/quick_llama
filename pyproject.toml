@@ -31,18 +31,18 @@ dependencies = [
     "cut-cross-entropy @ git+https://github.com/unslothai/cut-cross-entropy",
 ]
 
-# Optional dependencies (extras) - install via `pip install quick_llama[extra_name]`
 [project.optional-dependencies]
 triton = [
     # On macOS, Triton build attempt needs certifi and Git source
-    'certifi; platform_system=="Darwin"',
-    'triton @ git+https://github.com/triton-lang/triton.git#subdirectory=python; platform_system=="Darwin"',
+    'certifi ; platform_system=="Darwin"',
+    'triton @ git+https://github.com/triton-lang/triton.git#subdirectory=python ; platform_system=="Darwin"',
+
     # On Linux, install from PyPI (requires CUDA)
-    'triton>=3.1; platform_system=="Linux"',
+    'triton>=3.1 ; platform_system=="Linux"',
 ]
 flash = [
     # FlashAttention requires NVIDIA GPU and Linux
-    'flash_attn==2.6.3; platform_system=="Linux"',
+    'flash_attn==2.6.3 ; platform_system=="Linux"',
 ]
 optim = [
     # Installs all performance optimizations (triton, flash)
@@ -94,5 +94,4 @@ Repository = "https://github.com/samblouir/quick_llama"
 Issues = "https://github.com/samblouir/quick_llama"
 
 [tool.setuptools.packages.find]
-# Assumes package code is in 'src/' directory
 where = ["src"]
