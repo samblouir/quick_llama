@@ -48,44 +48,6 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
-[project.optional-dependencies]
-triton = [
-    # On macOS, Triton build attempt needs certifi and Git source
-    'certifi ; platform_system=="Darwin"',
-    'triton @ git+https://github.com/triton-lang/triton.git#subdirectory=python ; platform_system=="Darwin"',
-
-    # On Linux, install from PyPI (requires CUDA)
-    'triton>=3.1 ; platform_system=="Linux"',
-]
-flash = [
-    'flash_attn==2.6.3',
-]
-optim = [
-    # Installs all performance optimizations (triton, flash)
-    "quick_llama[triton]",
-    "quick_llama[flash]",
-]
-dev = [
-    # Dependencies for development (testing, linting, formatting)
-    "pytest>=7.0",
-    "pytest-cov",
-    "ruff",
-    "mypy",
-]
-utils = [
-    "psutil>=5.8.0",
-]
-tokenizers = [
-    "sentencepiece",
-    "protobuf",
-]
-all = [
-    # Installs all optional and development dependencies
-    "quick_llama[optim]",
-    "quick_llama[dev]",
-    "quick_llama[utils]",
-    "quick_llama[tokenizers]",
-]
 
 [project.urls]
 Homepage = "https://github.com/samblouir/quick_llama"
