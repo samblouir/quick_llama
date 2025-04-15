@@ -22,15 +22,15 @@ Quick Llama provides an optimized implementation targeting **Llama 3.2 1B**. It 
 ## Key Features
 
 * **Optimized Llama 3.2 1B:** Tailored for efficient training and inference.
-* **Efficient Training:** Enables gradient-checkpoint-free fine-tuning/pre-training on modest hardware (e.g., 4x A100 80GB).
-* **Distributed Training:** Built-in support for distributed data parallelism using [Hugging Face Accelerate](https://huggingface.co/docs/accelerate), including FP16 communication and overlap of computation/communication.
-* **Advanced Attention Mechanisms:** Leverages [Flex Attention](https://pytorch.org/blog/flexattention/) with support for dynamically generated block-sparsity masks. Also includes Grouped Query Attention (GQA).
-* **Optimized Components:** Includes cached Triton-based Rotary Positional Encodings (RoPE) and efficient cross-entropy implementations (inspired by Unsloth/Apple).
-* **Flexible Data Handling:** Supports sequence packing for efficient batching.
+* **Efficient Training:** Enables gradient-checkpoint-free training using modest hardware (instruction tune on 1 million training examples within a few hours using 4x A100 80GB).
+* **Distributed Training:** Built-in support for distributed data parallelism using [HuggingFace Accelerate](https://huggingface.co/docs/accelerate), including FP16 communication and overlap of computation/communication.
+* **Efficient Attention Implementation:** Leverages [Flex Attention](https://pytorch.org/blog/flexattention/) with efficient block-sparsity masks and sequence packing.
+* **Optimized Components:** Includes cached Triton-based Rotary Positional Encodings (RoPE) and efficient cross-entropy implementations (from Unsloth/Apple, with adjustments).
+* **Flexible Data Handling:** Included data pre-processor automatically adds necessary auxiliary data for Flex Attention.
 * **Utilities Included:**
-    * Automatic weight download/conversion from Hugging Face Hub format.
-    * Training script with configuration management, logging (TensorBoard support via Accelerate), and checkpointing.
-    * Basic command-line interface for interacting with the model.
+    * Automatic weight download and conversion of Llama 3.2 1B's weights from HuggingFace to a Torch format.
+    * Example training script with configuration management, logging (TensorBoard support via Accelerate), and checkpointing.
+    * Basic command-line interface for conversing with the model.
     * Integration support for evaluation using [EleutherAI's LM Harness](https://github.com/EleutherAI/lm-evaluation-harness).
 * **Performance:** Supports `torch.compile` to optimize performance.
 
@@ -40,7 +40,7 @@ Quick Llama provides an optimized implementation targeting **Llama 3.2 1B**. It 
 Quick Llama includes techniques and code inspired by or adapted from:
 
 * [Splash Attention](https://github.com/jax-ml/jax/blob/main/jax/experimental/pallas/ops/tpu/splash_attention/splash_attention_kernel.py)
-* [Flex Attention](https://pytorch.org/blog/flexattention/)
+* [FlexAttention](https://pytorch.org/blog/flexattention/)
 * [Apple's Cross-Entropy Loss](https://github.com/apple/ml-cross-entropy)
 * [Unsloth.AI](https://github.com/unslothai/) (Triton Kernels, RoPE)
 * [Meta's Llama Reference Implementation](https://github.com/meta-llama/llama/blob/main/llama/model.py) (RoPE)
@@ -51,7 +51,7 @@ This codebase is in use/has been used for several papers for ACL, EMNLP, and Neu
 ## Tested Setup
 
 * Hardware: 4x A100 80GB GPUs
-* Parameters: Sequence lengths >= 4096, effective batch sizes 32-64.
+* Parameters: Sequence lengths >= 4096, batch sizes 32-64.
 
 ## Requirements
 
@@ -60,8 +60,6 @@ This codebase is in use/has been used for several papers for ACL, EMNLP, and Neu
 * Triton >= 3.1
 * Hugging Face Libraries: `transformers`, `accelerate`, `datasets`, `huggingface-hub`
 * Other libraries: `safetensors`, `numpy`, `tqdm`
-
-*(See `pyproject.toml` for specific version requirements)*
 
 **Hugging Face Token:**
 You must set the environment variable `HF_TOKEN` with your HuggingFace token that has been granted access to [Meta's Llama 3.2 repository](https://huggingface.co/meta-llama/Llama-3.2-1B) to download the weights.
@@ -183,9 +181,20 @@ Use `accelerate launch` to start a training run. Accelerate will automatically h
     * Checkpoints are saved periodically in the `output_dir`.
     * TensorBoard logs can be viewed by running `tensorboard --logdir ./training_logs`.
 
+### Trouble-shooting
+
+```bash
+# Nuclear option for flash-attn issues:
+## Re-installs flash-attn and dependencies
+## Warning: This will changes the versions of some packages
+pip uninstall flash-attn -y
+pip install flash-attn --no-build-isolation --force-reinstall
+```
+
+
 ### Evaluation (EleutherAI LM Harness Adapter)
 
-Documentation coming soon.
+Documentation for this module is coming soon.
 This allows you to run the EleutherAI LM Harness without needing to re-export the model to the HuggingFace format and running lm_eval.
 
 ## TODO:
