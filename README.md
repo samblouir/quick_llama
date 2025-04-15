@@ -1,6 +1,9 @@
 # Quick LLaMa: Efficient and Flexible LLaMa
 
-Quick Llama provides an optimized implementation targeting **Llama 3.2 1B**. It is designed for efficient **gradient-checkpoint-free fine-tuning and second-stage pre-training** using modest hardware setups.
+# This codebase is currently being refactored for Github and is/has been used for submissions to ACL, EMNLP, and NeurIPS 2025.
+
+Quick Llama provides an optimized implementation targeting **Llama 3.2 1B**. It is designed for efficient **gradient-checkpoint-free training** on 80GB GPUs.
+
 
 ---
 <div align="center">
@@ -21,32 +24,30 @@ Quick Llama provides an optimized implementation targeting **Llama 3.2 1B**. It 
 
 ## Key Features
 
-* **Optimized Llama 3.2 1B:** Tailored for efficient training and inference.
-* **Efficient Training:** Enables gradient-checkpoint-free training using modest hardware (instruction tune on 1 million training examples within a few hours using 4x A100 80GB).
-* **Distributed Training:** Built-in support for distributed data parallelism using [HuggingFace Accelerate](https://huggingface.co/docs/accelerate), including FP16 communication and overlap of computation/communication.
-* **Efficient Attention Implementation:** Leverages [Flex Attention](https://pytorch.org/blog/flexattention/) with efficient block-sparsity masks and sequence packing.
-* **Optimized Components:** Includes cached Triton-based Rotary Positional Encodings (RoPE) and efficient cross-entropy implementations (from Unsloth/Apple, with adjustments).
-* **Flexible Data Handling:** Included data pre-processor automatically adds necessary auxiliary data for Flex Attention.
+* **Optimized Llama 3.2 1B:** A Torch-based implementation with some **Triton kernels** and **FlexAttention**.
+* **Efficient Training:** Enables gradient-checkpoint-free training to reduce compute: instruction tune on 1 million training examples within two hours using 4x A100 80GB with a sequence length of 4096 and a global batch size of 32.
+* **Distributed Training:** Built-in support for distributed data parallelism using [HuggingFace Accelerate](https://huggingface.co/docs/accelerate). Defaults to FP16 communication and overlapped backwards pass computation and communication.
+* **Efficient Attention Implementation:** Leverages [Flex Attention](https://pytorch.org/blog/flexattention/) with efficient block-sparsity masks and proper sequence packing. This allows us to simply skip computing on tokens we would otherwise mask out, like padding tokens, or tokens from sequences other than a specific sample.
+* **Optimized Vocab. Head and RoPE:** Includes cached Triton-based Rotary Positional Encodings (RoPE) and efficient cross-entropy implementations (from Apple and Unsloth.AI, with some tweaks to fix negative loss issues).
+* **Flexible Data Handling:** Included data pre-processor automatically adds necessary auxiliary data for efficient FlexAttention, enabling block-sparsity masks and sequence packing. The processor also allows for proper sequence packing for SSMs and prefix-LMs.
 * **Utilities Included:**
-    * Automatic weight download and conversion of Llama 3.2 1B's weights from HuggingFace to a Torch format.
+    * Automatic weight download and conversion of Llama 3.2 1B's weights from HuggingFace to our Torch format.
     * Example training script with configuration management, logging (TensorBoard support via Accelerate), and checkpointing.
     * Basic command-line interface for conversing with the model.
-    * Integration support for evaluation using [EleutherAI's LM Harness](https://github.com/EleutherAI/lm-evaluation-harness).
-* **Performance:** Supports `torch.compile` to optimize performance.
+    * Evaluation using [EleutherAI's LM Harness](https://github.com/EleutherAI/lm-evaluation-harness).
+* **Performance:** Compatible with `torch.compile` for optimal performance.
 
 
-## Implemented Optimizations
-
-Quick Llama includes techniques and code inspired by or adapted from:
+## Quick Llama includes techniques and code inspired by or adapted from:
 
 * [Splash Attention](https://github.com/jax-ml/jax/blob/main/jax/experimental/pallas/ops/tpu/splash_attention/splash_attention_kernel.py)
 * [FlexAttention](https://pytorch.org/blog/flexattention/)
 * [Apple's Cross-Entropy Loss](https://github.com/apple/ml-cross-entropy)
-* [Unsloth.AI](https://github.com/unslothai/) (Triton Kernels, RoPE)
+* [Unsloth.AI](https://github.com/unslothai/) (RoPE Triton Kernels and Cross-Entropy Loss)
 * [Meta's Llama Reference Implementation](https://github.com/meta-llama/llama/blob/main/llama/model.py) (RoPE)
 * [HuggingFace's Llama 3.2 Implementation](https://huggingface.co/meta-llama/Llama-3.2-1B)
 
-This codebase is in use/has been used for several papers for ACL, EMNLP, and NeurIPS 2025, and is being refactored for Github.
+
 
 ## Tested Setup
 
@@ -66,6 +67,12 @@ You must set the environment variable `HF_TOKEN` with your HuggingFace token tha
 
 ```bash
 export HF_TOKEN="your_hf_token_here"
+python quick_llama/minimal_training_example.py
+
+## Alternatively:
+
+HF_TOKEN="your_hf_token_here"python quick_llama/minimal_training_example.py
+
 ```
 
 ## Installation
@@ -95,7 +102,7 @@ This project uses HuggingFace Accelerate for handling distributed training and d
 # Minimal Example
 # This will download the model weights and run a minimal training example.
 # It also shows prints out a processed batch by the the data processor, which adds necessary auxiliary information for the Flex Attention block sparsity mask used.
-python src/minimal_training_example.py
+python quick_llama/minimal_training_example.py
 ```
 
 ```bash
