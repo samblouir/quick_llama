@@ -6,6 +6,7 @@ This example shows:
 5) Showing a short training loop
 
 Usage:
+pip install git+https://www.github.com/SamBlouir/quick_llama
 NUM_LOCAL_GPUS=1
 accelerate launch --num_processes ${NUM_LOCAL_GPUS} minimal_training_example.py
 
