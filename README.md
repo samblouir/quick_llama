@@ -71,8 +71,10 @@ python quick_llama/minimal_training_example.py
 
 ## Alternatively:
 
-HF_TOKEN="your_hf_token_here"python quick_llama/minimal_training_example.py
+HF_TOKEN="your_hf_token_here" python quick_llama/minimal_training_example.py
 
+NUM_GPUS=4
+HF_TOKEN="your_hf_token_here" accelerate launch --num_processes ${NUM_GPUS} quick_llama/minimal_training_example.py
 ```
 
 ## Installation
@@ -87,7 +89,6 @@ python -m venv .venv
 
 ## Choose the correct version based on your CUDA version
 ### You can see your CUDA version by running `nvcc --version` or `nvidia-smi`
-
 
 ### Cuda 11.8
 pip install --upgrade --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu118
@@ -146,13 +147,15 @@ This project uses HuggingFace Accelerate for handling distributed training and d
 ```bash
 # Minimal Example
 # This will download the model weights and run a minimal training example.
-# It also shows prints out a processed batch by the the data processor, which adds necessary auxiliary information for the Flex Attention block sparsity mask used.
-python quick_llama/minimal_training_example.py
+# It also shows prints out a processed batch by the the data processor, which adds necessary auxiliary information for FlexAttention's sparsity.
+cd quick_llama/src/quick_llama
+python minimal_training_example.py
 ```
 
 ```bash
 
 # 1 GPU on a local machine
+cd quick_llama/src/quick_llama
 python train_wrapper.py \
 	--dataset_name "teknium/OpenHermes-2.5" \
 	--batch_size_per_device 32 \
@@ -166,7 +169,8 @@ python train_wrapper.py \
 
 ```bash
 # 4 GPUs on a local machine
-accelerate launch --num_gpus 4 train_wrapper.py \
+cd quick_llama/src/quick_llama
+accelerate launch --num_processes 4 train_wrapper.py \
 	--dataset_name "teknium/OpenHermes-2.5" \
 	--batch_size_per_device 8 \
 	--gradient_accumulation_steps 4 \
@@ -178,8 +182,9 @@ accelerate launch --num_gpus 4 train_wrapper.py \
 ```
 
 ```bash
-# Multi-node setup
-accelerate launch --num_processes 8 --num_machines 2 --machine_rank 0 train_wrapper.py \
+# Multi-node setup: 2 machines with 4 GPUs each
+cd quick_llama/src/quick_llama
+accelerate launch --num_processes 8 --num_machines 2 minimal_training_example.py \
 	--dataset_name "teknium/OpenHermes-2.5" \
 	--batch_size_per_device 8 \
 	--gradient_accumulation_steps 4 \
