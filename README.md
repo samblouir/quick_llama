@@ -138,8 +138,6 @@ Try running this:
 pip install --upgrade transformers
 ```
 
-
-
 ## Usage
 
 This project uses HuggingFace Accelerate for handling distributed training and device placement.
@@ -147,10 +145,21 @@ This project uses HuggingFace Accelerate for handling distributed training and d
 ```bash
 # Minimal Example
 # This will download the model weights and run a minimal training example.
-# It also shows prints out a processed batch by the the data processor, which adds necessary auxiliary information for FlexAttention's sparsity.
+# It also shows prints out a processed batch by the data processor, which adds necessary auxiliary information for FlexAttention's sparsity.
 cd quick_llama/src/quick_llama
 python minimal_training_example.py
 ```
+
+### SLURM
+
+An example SLURM script is provided for running on a cluster.
+You should modify the `sbatch_quick_llama.sh` script to suit your cluster, especially the `partition` and `qos` settings.
+```bash
+sbatch sbatch_quick_llama.sh
+```
+
+
+### Manual Commands
 
 ```bash
 
