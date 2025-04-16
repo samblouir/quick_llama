@@ -1,6 +1,6 @@
 """
 This example shows:
-1) Loading a small LLaMA-like model via model_arch.load_model().
+1) Loading in LLaMA 1B model via model_arch.load_model().
 2) Tokenizing "Hello" and "World" and using them as input_ids and label_ids for the data preprocessor.
 4) Showing the outputs of the data preprocessor
 5) Showing a short training loop
@@ -29,7 +29,7 @@ def main():
         "minimum_sequence_length": 0,
     }
 
-    # 2) Load a small LLaMA-like model
+    # 2) Load in Llama 1B with a faster implementation
     model = load_model(config=config)
     print(f"Model parameter count: {sum(p.numel() for p in model.parameters())}")
 
