@@ -1,6 +1,6 @@
 # Quick LLaMa: Efficient and Flexible LLaMa
 
-# This codebase is currently being refactored for Github and is/has been used for submissions to ACL, EMNLP, and NeurIPS 2025.
+## This codebase is currently being refactored for Github and is/has been used for submissions to ACL, EMNLP, and NeurIPS 2025.
 
 Quick Llama provides an optimized implementation targeting **Llama 3.2 1B**. It is designed for efficient **gradient-checkpoint-free training** on 80GB GPUs.
 
@@ -77,22 +77,67 @@ HF_TOKEN="your_hf_token_here"python quick_llama/minimal_training_example.py
 
 ## Installation
 
-It is highly recommended to install in a virtual environment (e.g., using `venv` or `conda`).
+It is highly recommended to install this in a virtual environment (e.g., using `venv` or `conda`).
 
 ```bash
-# Create and activate a virtual environment (example using venv)
+# Create and activate a virtual environment
 python -m venv .venv
-source .venv/bin/activate # On Linux/macOS
-# .venv\Scripts\activate # On Windows
 
-# Clone the repository
+## Install dependencies
+
+## Choose the correct version based on your CUDA version
+### You can see your CUDA version by running `nvcc --version` or `nvidia-smi`
+
+
+### Cuda 11.8
+pip install --upgrade --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu118
+
+### Cuda 12.6
+pip install --upgrade --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu126
+
+### Cuda 12.8
+pip install --upgrade --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+```
+
+
+### Once you have installed a suitable Torch version, you can now install quick_llama:
+
+#### Method 1: Install via pip
+```bash
+pip install --upgrade git+https://www.github.com/samblouir/quick_llama
+```
+
+#### Method 2: Clone the repository
+```bash
 git clone https://github.com/samblouir/quick_llama
 cd quick_llama
 
 # Install the base package in editable mode
 pip install -e .
-
 ```
+
+# Troubleshooting:
+
+## Flash Attention
+If you are having issues with flash-attn (one reason this can happen is if you update Torch):
+```bash
+pip uninstall flash-attn -y
+pip install flash-attn --no-build-isolation --force-reinstall --no-deps
+```
+
+## Upgrade Transformers package
+
+If you get an error like this:
+```
+RuntimeError: Failed to import transformers.models.llama.modeling_llama because of the following error (look up to see its traceback):
+operator torchvision::nms does not exist
+```
+Try running this:
+```bash
+pip install --upgrade transformers
+```
+
+
 
 ## Usage
 

@@ -1,3 +1,4 @@
+flash_attn
 torch>=2.5
 transformers>=4.40
 huggingface-hub>=0.20
@@ -8,5 +9,4 @@ numpy>=1.20.0
 tqdm>=4.60.0
 einops>=0.7.0
 lm-eval>=0.4
-flash_attn==2.6.3
 cut-cross-entropy@ git+https://github.com/unslothai/cut-cross-entropy

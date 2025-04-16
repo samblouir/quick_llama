@@ -22,15 +22,17 @@ import torch
 import torch.nn as nn
 import einops
 
-try:
-    from torch.nn.attention.flex_attention import create_block_mask
-    from torch.nn.attention.flex_attention import flex_attention as _raw_flex_attention
+from torch.nn.attention.flex_attention import flex_attention as _flex_attention
+from torch.nn.attention.flex_attention import create_block_mask
+# try:
+#     from torch.nn.attention.flex_attention import create_block_mask
+#     from torch.nn.attention.flex_attention import flex_attention as _raw_flex_attention
 
-    _flex_attention = torch.compile(_raw_flex_attention, dynamic=True, options={})
-    FLEX_ATTENTION_AVAILABLE = True
-except ImportError:
-    FLEX_ATTENTION_AVAILABLE = False
-    logging.warning("flex_attention not found; fallback or error may occur if used.")
+#     _flex_attention = torch.compile(_raw_flex_attention, dynamic=True, options={})
+#     FLEX_ATTENTION_AVAILABLE = True
+# except ImportError:
+#     FLEX_ATTENTION_AVAILABLE = False
+#     logging.warning("flex_attention not found; fallback or error may occur if used.")
 
 from safetensors.torch import load_file as load_safetensors_file
 from transformers import AutoModelForCausalLM
@@ -41,12 +43,12 @@ from . import rotary
 
 TRITON_ROPE_AVAILABLE = False
 try:
-    raise Exception("TODO: Double-check correctness. Fallback to Python-based RoPE.")
+    raise Exception("Falling back to Python-based RoPE until Triton-based RoPE correctness is verified.")
     from .triton_rotary import fast_rope_embedding
 
     TRITON_ROPE_AVAILABLE = True
 except Exception as e:
-    logging.warning(f"Triton-based RoPE not available; falling back to Python-based RoPE. e: {e}")
+    logging.warning(f"Triton-based RoPE not available; falling back to Python-based RoPE.\n Reason/e: {e}")
     TRITON_ROPE_AVAILABLE = False
 
 
@@ -187,14 +189,19 @@ class self_attn(nn.Module):
         self.k_proj = LinearProjection(self.hidden_size, v_dims, **kwargs)
         self.v_proj = LinearProjection(self.hidden_size, v_dims, **kwargs)
         self.o_proj = LinearProjection(qk_dims, self.hidden_size, **kwargs)
-        self.enable_gqa = self.gqa_num_heads != self.num_heads
+
+        self.enable_gqa = (self.gqa_num_heads != self.num_heads)
+
         if self.enable_gqa:
             if not (
-                self.gqa_num_heads > 0 and self.num_heads % self.gqa_num_heads == 0
+                (self.gqa_num_heads > 0) 
+                and \
+                    (self.num_heads % self.gqa_num_heads == 0)
             ):
-                raise ValueError("num_key_value_heads must divide num_attention_heads")
+                raise ValueError(f"self.gqa_num_heads ({self.gqa_num_heads}) must divide self.num_heads ({self.num_heads})")
+            
             if not (self.gqa_num_heads < self.num_heads):
-                raise ValueError("num_key_value_heads must be < num_attention_heads")
+                raise ValueError(f"self.gqa_num_heads ({self.gqa_num_heads}) must be < self.num_heads ({self.num_heads})")
 
         self.use_triton_rope = bool(kwargs.get("use_triton_rope", False))
 
@@ -202,32 +209,13 @@ class self_attn(nn.Module):
         self, x: torch.Tensor, block_mask=None, freqs_cis=None, *args, **kwargs
     ):
         q = einops.rearrange(self.q_proj(x), "b s (h d) -> b s h d", h=self.num_heads)
-        k = einops.rearrange(
-            self.k_proj(x), "b s (h d) -> b s h d", h=self.gqa_num_heads
-        )
-        v = einops.rearrange(
-            self.v_proj(x), "b s (h d) -> b s h d", h=self.gqa_num_heads
-        )
+        k = einops.rearrange(self.k_proj(x), "b s (h d) -> b s h d", h=self.gqa_num_heads)
 
-        if freqs_cis is not None:
-            if (
-                self.use_triton_rope
-                and TRITON_ROPE_AVAILABLE
-                and (self.gqa_num_heads == self.num_heads)
-            ):
-                cos_part = freqs_cis.real[: q.shape[1], : q.shape[-1]]
-                sin_part = freqs_cis.imag[: q.shape[1], : q.shape[-1]]
-                q_f32 = q.to(torch.float32)
-                k_f32 = k.to(torch.float32)
-                q_out, k_out = fast_rope_embedding(q_f32, k_f32, cos_part, sin_part)
-                q = q_out.to(q.dtype)
-                k = k_out.to(k.dtype)
-            else:
-                q, k = rotary.apply_rotary_emb(q, k, freqs_cis.to(q.device))
+        q, k = rotary.apply_rotary_emb(q, k, freqs_cis.to(q.device))
 
         q = einops.rearrange(q, "b s h d -> b h s d")
         k = einops.rearrange(k, "b s h d -> b h s d")
-        v = einops.rearrange(v, "b s h d -> b h s d", h=self.gqa_num_heads)
+        v = einops.rearrange(self.v_proj(x), "b s (h d) -> b h s d", h=self.gqa_num_heads)
 
         attn_out = _flex_attention(
             query=q, key=k, value=v, block_mask=block_mask, enable_gqa=self.enable_gqa
@@ -332,9 +320,7 @@ class BaseModel(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
         embed_dropout = self.config.get("embed_dropout", 0.0)
-        self.embed_dropout = (
-            nn.Dropout(p=embed_dropout) if embed_dropout > 0 else nn.Identity()
-        )
+        self.embed_dropout = (nn.Dropout(p=embed_dropout) if embed_dropout > 0 else nn.Identity())
 
         self.layers = nn.ModuleList(
             [DecoderLayer(layer_idx=i, **self.config) for i in range(self.num_layers)]
@@ -399,10 +385,10 @@ class BaseModel(nn.Module):
         segment_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         return_per_sample_loss: bool = False,
-        softmax_temperature: float = 1.0,
         reduction=None,
         **kwargs,
     ) -> torch.Tensor:
+        
         def mask_mod(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
             segment_mask = segment_ids[b, q_idx] == segment_ids[b, kv_idx]
@@ -490,39 +476,9 @@ def load_model_from_safetensors(
 def _load_model(target_model, config):
     instruct = config.get("instruct", True)
     if instruct:
-        source_model = AutoModelForCausalLM.from_pretrained(
-            "meta-llama/Llama-3.2-1B-Instruct"
-        )
+        source_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
     else:
         source_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
-
-    # aaa = LlamaConfig(
-    #     vocab_size=128256,
-    #     hidden_size=2048,
-    #     intermediate_size=8192,
-    #     num_hidden_layers=16,
-    #     num_attention_heads=32,
-    #     num_key_value_heads=8,
-    #     hidden_act="silu",
-    #     max_position_embeddings=131072,
-    #     initializer_range=0.02,
-    #     rms_norm_eps=1e-5,
-    #     use_cache=True,
-    #     pad_token_id=None,
-    #     bos_token_id=128000,
-    #     eos_token_id=128001,
-    #     pretraining_tp=1,
-    #     tie_word_embeddings=True,
-    #     rope_theta=500000.0,
-    #     rope_scaling={
-    #         "factor": 32.0,
-    #         "high_freq_factor": 4.0,
-    #         "low_freq_factor": 1.0,
-    #         "original_max_position_embeddings": 8192,
-    #         "rope_type": "llama3",
-    #     },
-    #     attention_bias=False,
-    # )
 
     target_model.embeddings.weight.data = (source_model.model.embed_tokens.weight.data.clone())
     

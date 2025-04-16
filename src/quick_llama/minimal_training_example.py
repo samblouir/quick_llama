@@ -73,15 +73,11 @@ def main():
     packer_batcher.debug_alignments(batch)
     print(f"*" * 60,)
 
-    # 5) Convert from numpy arrays to torch Tensors and reshape to [batch_size, seq_len].
-    #    We'll keep batch_size=1 from the Batcher in this example.
+    # 5) Convert from numpy arrays to torch Tensors and send them to the accelerator
     def send_to_gpu(batch):
         new_batch = {}
         for k, v in batch.items():
-            if isinstance(v, np.ndarray):
-                new_batch[k] = torch.tensor(v).to(accelerator.device)
-            else:
-                new_batch[k] = v
+            new_batch[k] = torch.tensor(v, dtype=torch.int32).to(accelerator.device)
         return new_batch
     gpu_batch = send_to_gpu(batch)
 
