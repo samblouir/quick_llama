@@ -13,7 +13,6 @@ import torch.nn as nn
 import math
 from safetensors.torch import load_file as load_safetensors, save_file
 from accelerate import Accelerator
-from accelerate.utils import save_accelerator_state, load_accelerator_state
 from accelerate.logging import get_logger
 import glob
 import shutil

@@ -85,6 +85,7 @@ def main():
             train_logger.log_message(
                 f"Attempting to resume from checkpoint: {checkpoint_to_load}"
             )
+            # model, optimizer, lr_scheduler, are updated in-place
             loaded_step = model_utils.load_checkpoint(
                 accelerator, checkpoint_to_load, model, optimizer, lr_scheduler
             )

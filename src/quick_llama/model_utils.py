@@ -4,13 +4,11 @@ import torch.nn as nn
 import math
 from safetensors.torch import load_file as load_safetensors
 from accelerate import Accelerator
-from accelerate.utils import save_accelerator_state, load_accelerator_state
 from accelerate.logging import get_logger
 import glob
 import shutil
 import json
-
-import trainable_llama # Assuming this exists and has TrainableLlama class
+from quick_llama.models import trainable_llama
 
 log = get_logger(__name__)
 
@@ -33,7 +31,7 @@ def create_model(config):
 
 def create_optimizer_and_scheduler(model, config, num_training_steps):
     """Creates optimizer and learning rate scheduler."""
-    no_decay = ["bias", "LayerNorm.weight", "layernorm.weight"] # Common no_decay parameters
+    no_decay = ["bias", "LayerNorm.weight", "layernorm.weight"]
     optimizer_grouped_parameters = [
         {
             "params": [p for n, p in model.named_parameters() if not any(nd in n.lower() for nd in no_decay) and p.requires_grad],
