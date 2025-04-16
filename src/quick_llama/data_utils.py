@@ -54,9 +54,7 @@ def get_tokenizer():
 def tokenize_text(text):
     """Tokenizes a single string of text."""
     tokenizer = get_tokenizer()
-    return tokenizer(str(text), return_tensors="np", add_special_tokens=False)[
-        "input_ids"
-    ][0]
+    return tokenizer(str(text), return_tensors="np", add_special_tokens=False)["input_ids"][0]
 
 
 def tokenize_chat(messages):

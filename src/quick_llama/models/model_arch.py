@@ -485,7 +485,7 @@ def load_model_from_safetensors(
 
 
 def _load_model(target_model, config):
-    instruct = config.get("instruct", False)
+    instruct = config.get("instruct", True)
     if instruct:
         source_model = AutoModelForCausalLM.from_pretrained(
             "meta-llama/Llama-3.2-1B-Instruct"
@@ -521,55 +521,18 @@ def _load_model(target_model, config):
         attention_bias=False,
     )
 
-    target_model.embeddings.weight.data = (
-        source_model.model.embed_tokens.weight.data.clone()
-    )
+    target_model.embeddings.weight.data = (source_model.model.embed_tokens.weight.data.clone())
+    
     for i in range(len(source_model.model.layers)):
-        target_model.layers[
-            i
-        ].self_attn.q_proj.layer.weight.data = source_model.model.layers[
-            i
-        ].self_attn.q_proj.weight.data.clone()
-        target_model.layers[
-            i
-        ].self_attn.k_proj.layer.weight.data = source_model.model.layers[
-            i
-        ].self_attn.k_proj.weight.data.clone()
-        target_model.layers[
-            i
-        ].self_attn.v_proj.layer.weight.data = source_model.model.layers[
-            i
-        ].self_attn.v_proj.weight.data.clone()
-        target_model.layers[
-            i
-        ].self_attn.o_proj.layer.weight.data = source_model.model.layers[
-            i
-        ].self_attn.o_proj.weight.data.clone()
-        target_model.layers[
-            i
-        ].mlp.gate_proj.layer.weight.data = source_model.model.layers[
-            i
-        ].mlp.gate_proj.weight.data.clone()
-        target_model.layers[
-            i
-        ].mlp.up_proj.layer.weight.data = source_model.model.layers[
-            i
-        ].mlp.up_proj.weight.data.clone()
-        target_model.layers[
-            i
-        ].mlp.down_proj.layer.weight.data = source_model.model.layers[
-            i
-        ].mlp.down_proj.weight.data.clone()
-        target_model.layers[
-            i
-        ].input_layernorm.norm.weight.data = source_model.model.layers[
-            i
-        ].input_layernorm.weight.data.clone()
-        target_model.layers[
-            i
-        ].post_attention_layernorm.norm.weight.data = source_model.model.layers[
-            i
-        ].post_attention_layernorm.weight.data.clone()
+        target_model.layers[i].self_attn.q_proj.layer.weight.data = source_model.model.layers[i].self_attn.q_proj.weight.data.clone()
+        target_model.layers[i].self_attn.k_proj.layer.weight.data = source_model.model.layers[i].self_attn.k_proj.weight.data.clone()
+        target_model.layers[i].self_attn.v_proj.layer.weight.data = source_model.model.layers[i].self_attn.v_proj.weight.data.clone()
+        target_model.layers[i].self_attn.o_proj.layer.weight.data = source_model.model.layers[i].self_attn.o_proj.weight.data.clone()
+        target_model.layers[i].mlp.gate_proj.layer.weight.data = source_model.model.layers[i].mlp.gate_proj.weight.data.clone()
+        target_model.layers[i].mlp.up_proj.layer.weight.data = source_model.model.layers[i].mlp.up_proj.weight.data.clone()
+        target_model.layers[i].mlp.down_proj.layer.weight.data = source_model.model.layers[i].mlp.down_proj.weight.data.clone()
+        target_model.layers[i].input_layernorm.norm.weight.data = source_model.model.layers[i].input_layernorm.weight.data.clone()
+        target_model.layers[i].post_attention_layernorm.norm.weight.data = source_model.model.layers[i].post_attention_layernorm.weight.data.clone()
 
     target_model.norm.norm.weight.data = source_model.model.norm.weight.data.clone()
     target_model.lm_head.data = source_model.lm_head.weight.data.clone()
@@ -581,11 +544,14 @@ def _load_model(target_model, config):
 def load_model(
     config: Optional[dict] = None,
     hf_model_name: Optional[str] = None,
-    instruct: bool = True,
+    instruct: bool = None,
 ) -> BaseModel:
     merged_config = merge_config_overrides(config)
+
     logging.info("Creating BaseModel using merged config...")
     model = BaseModel(merged_config)
+    if instruct is not None:
+        merged_config['instruct'] = instruct
     model = _load_model(model, merged_config)
     final_dtype = str_to_dtype(merged_config.get("dtype", "bfloat16"))
     model = model.to(final_dtype)

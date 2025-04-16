@@ -6,9 +6,13 @@ This example shows:
 5) Showing a short training loop
 
 Usage:
+```
+
+
 pip install git+https://www.github.com/SamBlouir/quick_llama
 NUM_LOCAL_GPUS=1
 accelerate launch --num_processes ${NUM_LOCAL_GPUS} minimal_training_example.py
+```
 
 """
 import numpy as np
@@ -35,29 +39,30 @@ def main():
         "minimum_sequence_length": 0,
     }
 
-    # 2) Load in Llama 1B with a faster implementation
+    # 2) Load in Llama 1B with our faster implementation
     model = load_model(config=config)
     print(f"Model parameter count: {sum(p.numel() for p in model.parameters())}")
 
-    # 3) "Tokenize" two strings. Here we hardcode numeric IDs for brevity.
-    #    label_ids are the same as input_ids for a standard LM.
+    # 3) Tokenize two strings
     input_hello = data_utils.tokenize_text("Hello")
     label_world = data_utils.tokenize_text("World")
     
     # 4) Use packer_batcher to pack them into a single batch
     #    We'll define a small sequence_length for this demonstration.
     batcher = Batcher(config=config)
-    batcher.add(input_ids=input_hello, label_ids=label_world)   # Add first example
+    batcher.add(input_ids=input_hello, label_ids=label_world)
 
     # Retrieve the packed batch dictionary
     # Normally we'd check to see if batcher is ready to pop since it can't hold any more samples.
-    ## status = batcher.is_ready()
+    status = batcher.is_ready()
+    print(f"  status: {status}")
+        
     # but for this example we'll just pop the batch.
     batch = batcher.pop()
 
     print(f"*" * 60,)
     # Debugging function to check alignment
-    packer_batcher.debug_alignments(packer_batcher)
+    packer_batcher.debug_alignments(batch)
     print(f"*" * 60,)
 
     # 5) Convert from numpy arrays to torch Tensors and reshape to [batch_size, seq_len].
