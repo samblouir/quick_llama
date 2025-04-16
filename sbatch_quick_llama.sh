@@ -57,7 +57,7 @@ accelerate launch \
     --num_processes=2 \
     --num_machines=1 \
     --mixed_precision=bf16 \
-    main.py
+    minimal_training_example.py
 
 ##################################################
 echo "quick_llama finished with exit code $?."
