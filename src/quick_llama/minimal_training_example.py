@@ -4,6 +4,11 @@ This example shows:
 2) Tokenizing "Hello" and "World" and using them as input_ids and label_ids for the data preprocessor.
 4) Showing the outputs of the data preprocessor
 5) Showing a short training loop
+
+Usage:
+NUM_LOCAL_GPUS=1
+accelerate launch --num_processes ${NUM_LOCAL_GPUS} minimal_training_example.py
+
 """
 import numpy as np
 import torch
