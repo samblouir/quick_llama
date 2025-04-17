@@ -171,7 +171,7 @@ def main():
                     log.error("Model did not return a 'loss'.")
                     continue
 
-                avg_loss = accelerator.gather(loss).mean().item()
+                avg_loss = accelerator.gather(loss.mean()).item()
 
                 accelerator.backward(loss)
 
