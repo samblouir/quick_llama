@@ -310,11 +310,13 @@ class BaseModel(nn.Module):
             "original_max_position_embeddings", 8192
         )
         max_position_embeddings = self.config.get("max_position_embeddings", 131072)
+        # FIX: Use sequence_length instead of max_position_embeddings for freqs_cis
+        actual_seq_len = self.config.get("sequence_length", max_position_embeddings)
         freqs_cis = rotary.precompute_freqs_cis(
             dim=self.head_dim,
-            end=max_position_embeddings,
+            end=actual_seq_len,  # Use actual sequence length, not max_position_embeddings
             theta=base_decay_rate,
-            use_scaled=(max_position_embeddings > pretraining_seq_len),
+            use_scaled=(actual_seq_len > pretraining_seq_len),
             old_context_length=pretraining_seq_len,
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)

@@ -70,11 +70,14 @@ def setup_accelerator(config):
         ),
     ]
 
+    # Use config's log_with setting, default to None to avoid warnings
+    log_with = config.get('log_with', None)
+
     accelerator = Accelerator(
         mixed_precision=config['mixed_precision'],
         step_scheduler_with_optimizer=False,
         gradient_accumulation_steps=config['gradient_accumulation_steps'],
-        log_with="tensorboard", # Or ["tensorboard", "wandb"] or None
+        log_with=log_with,
         project_dir=config['output_dir'],
         kwargs_handlers=kwargs_handlers,
         device_placement=True,
