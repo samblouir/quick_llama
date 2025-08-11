@@ -417,13 +417,17 @@ class BaseModel(nn.Module):
 
         logits_16 = x.to(torch.float16)
         w_16 = self.lm_head.to(torch.float16)
-        if reduction is None:
-            loss_fn = self.LCE
+        if self.use_fusedlce:
+            logits_16 = x.to(torch.float16)
+            w_16 = self.lm_head.to(torch.float16)
+            loss_fn = self.LCE if reduction is None else self.LCE_none
+            loss = loss_fn(logits_16, w_16, label_ids)
         else:
-            assert reduction == "none", "Only 'none' reduction is supported."
-            loss_fn = self.LCE_none
-
-        loss = loss_fn(logits_16, w_16, label_ids)
+            B, L, D = x.shape
+            logits = torch.matmul(x.view(-1, D), self.lm_head.to(x.dtype).T)
+            logits = logits.view(B, L, self.vocab_size)
+            loss_fn = self.cross_entropy if reduction is None else self.cross_entropy_none
+            loss = loss_fn(logits.view(-1, self.vocab_size), label_ids.view(-1).long())
         return loss.to(torch.float32)
 
     def reset_freq_cis(self, seq_len: int, accelerator=None):

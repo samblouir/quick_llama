@@ -39,7 +39,7 @@ def main():
     accelerator = cfg.setup_accelerator(config)
 
     # Load the tokenizer and dataset
-    config = {
+    model_config = {
         "dtype": "bfloat16", # parameter and compute dtype
         "sequence_length": 128,
         "batch_size": 1,
@@ -48,7 +48,7 @@ def main():
     }
 
     # 2) Load in Llama 1B with our faster implementation
-    model = load_model(config=config)
+    model = load_model(config=model_config)
     print(f"Model parameter count: {sum(p.numel() for p in model.parameters())}")
 
     # 3) Tokenize two strings
@@ -57,7 +57,7 @@ def main():
     
     # 4) Use packer_batcher to pack them into a single batch
     #    We'll define a small sequence_length for this demonstration.
-    batcher = Batcher(config=config)
+    batcher = Batcher(config=model_config)
     batcher.add(input_ids=input_hello, label_ids=label_world)
 
     # Retrieve the packed batch dictionary
@@ -109,20 +109,21 @@ def main():
         lr_scheduler,
         last_step,
         config["checkpoint_dir"],
+        config,
         config.get("save_limit", 3),
     )
 
     # 9) Load the model
     # model, optimizer, lr_scheduler, are updated in-place
 
-    checkpoint_to_load = os.path.join(config['checkpoint_dir'], f"checkpoint_{int(last_step)}")
-    loaded_step = model_utils.load_checkpoint(
+    checkpoint_to_load = os.path.join(config['checkpoint_dir'], f"step_{int(last_step)}")
+    _, loaded_step = model_utils.load_checkpoint(
         accelerator, checkpoint_to_load, model, optimizer, lr_scheduler
     )
 
-    assert(last_step == loaded_step), f"Loaded step {loaded_step} does not match expected step {last_step}."
+    assert(last_step + 1 == loaded_step), f"Loaded step {loaded_step} does not match expected step {last_step}."
 
-    print(f"Checkpoint from step {last_step:.} loaded successfully.")
+    print(f"Checkpoint from step {last_step} loaded successfully.")
 
 if __name__ == "__main__":
     main()
