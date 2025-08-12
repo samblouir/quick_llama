@@ -288,9 +288,11 @@ class BaseModel(nn.Module):
     def __init__(self, layer_kwargs: dict):
         super().__init__()
         self.config = layer_kwargs
+        
+        # Use config values directly (already set by get_default_config)
         self.num_layers = self.config.get("num_hidden_layers", 16)
         self.hidden_size = self.config.get("hidden_size", 2048)
-        self.vocab_size = self.config.get("vocab_size", 32000)
+        self.vocab_size = self.config.get("vocab_size", 128256)
         self.num_heads = self.config.get("num_attention_heads", 32)
         self.head_dim = self.hidden_size // self.num_heads
 
@@ -464,8 +466,19 @@ def load_model_from_safetensors(
 
     if not os.path.exists(safetensors_path):
         raise FileNotFoundError(f"safetensors file not found: {safetensors_path}")
-    logging.info(f"Loading weights from: {safetensors_path}")
-    state_dict = load_safetensors_file(safetensors_path, device=device)
+    
+    # Check if it's a directory (checkpoint) or file
+    if os.path.isdir(safetensors_path):
+        safetensors_file = os.path.join(safetensors_path, "model.safetensors")
+    else:
+        safetensors_file = safetensors_path
+        
+    if not os.path.exists(safetensors_file):
+        raise FileNotFoundError(f"Model file not found: {safetensors_file}")
+        
+    logging.info(f"Loading weights from: {safetensors_file}")
+    # Load to CPU first to avoid device issues
+    state_dict = load_safetensors_file(safetensors_file, device="cpu")
     load_result = model.load_state_dict(state_dict, strict=False)
     logging.info(f"load_state_dict result: {load_result}")
 
@@ -510,14 +523,28 @@ def load_model(
     config: Optional[dict] = None,
     hf_model_name: Optional[str] = None,
     instruct: bool = None,
+    load_pretrained: bool = True,
+    checkpoint_path: Optional[str] = None,
 ) -> BaseModel:
     merged_config = merge_config_overrides(config)
 
     logging.info("Creating BaseModel using merged config...")
     model = BaseModel(merged_config)
-    if instruct is not None:
-        merged_config['instruct'] = instruct
-    model = _load_model(model, merged_config)
+    
+    if checkpoint_path:
+        # Load from local checkpoint (for instruction tuning from our pretrained model)
+        logging.info(f"Loading weights from checkpoint: {checkpoint_path}")
+        model = load_model_from_safetensors(merged_config, checkpoint_path)
+    elif load_pretrained:
+        # Load from HuggingFace (for continued pretraining)
+        logging.info("Loading pretrained weights from HuggingFace")
+        if instruct is not None:
+            merged_config['instruct'] = instruct
+        model = _load_model(model, merged_config)
+    else:
+        # Random initialization (for pretraining from scratch)
+        logging.info("Using random initialization for pretraining from scratch")
+    
     final_dtype = str_to_dtype(merged_config.get("dtype", "bfloat16"))
     model = model.to(final_dtype)
     logging.info(f"BaseModel ready, dtype={final_dtype}")
