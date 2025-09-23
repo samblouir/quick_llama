@@ -22,17 +22,15 @@ import torch
 import torch.nn as nn
 import einops
 
-from torch.nn.attention.flex_attention import flex_attention as _flex_attention
-from torch.nn.attention.flex_attention import create_block_mask
-# try:
-#     from torch.nn.attention.flex_attention import create_block_mask
-#     from torch.nn.attention.flex_attention import flex_attention as _raw_flex_attention
+try:
+    from torch.nn.attention.flex_attention import create_block_mask
+    from torch.nn.attention.flex_attention import flex_attention as _raw_flex_attention
 
-#     _flex_attention = torch.compile(_raw_flex_attention, dynamic=True, options={})
-#     FLEX_ATTENTION_AVAILABLE = True
-# except ImportError:
-#     FLEX_ATTENTION_AVAILABLE = False
-#     logging.warning("flex_attention not found; fallback or error may occur if used.")
+    _flex_attention = torch.compile(_raw_flex_attention, dynamic=True, options={})
+    FLEX_ATTENTION_AVAILABLE = True
+except ImportError:
+    FLEX_ATTENTION_AVAILABLE = False
+    logging.warning("flex_attention not found; fallback or error may occur if used.")
 
 from safetensors.torch import load_file as load_safetensors_file
 from transformers import AutoModelForCausalLM
@@ -43,9 +41,7 @@ from . import rotary
 
 TRITON_ROPE_AVAILABLE = False
 try:
-    raise Exception("Falling back to Python-based RoPE until Triton-based RoPE correctness is verified.")
-    from .triton_rotary import fast_rope_embedding
-
+    from .triton_rotary_safe import fast_rope_embedding
     TRITON_ROPE_AVAILABLE = True
 except Exception as e:
     logging.warning(f"Triton-based RoPE not available; falling back to Python-based RoPE.\n Reason/e: {e}")
@@ -194,12 +190,12 @@ class self_attn(nn.Module):
 
         if self.enable_gqa:
             if not (
-                (self.gqa_num_heads > 0) 
+                (self.gqa_num_heads > 0)
                 and \
                     (self.num_heads % self.gqa_num_heads == 0)
             ):
                 raise ValueError(f"self.gqa_num_heads ({self.gqa_num_heads}) must divide self.num_heads ({self.num_heads})")
-            
+
             if not (self.gqa_num_heads < self.num_heads):
                 raise ValueError(f"self.gqa_num_heads ({self.gqa_num_heads}) must be < self.num_heads ({self.num_heads})")
 
@@ -288,7 +284,7 @@ class BaseModel(nn.Module):
     def __init__(self, layer_kwargs: dict):
         super().__init__()
         self.config = layer_kwargs
-        
+
         # Use config values directly (already set by get_default_config)
         self.num_layers = self.config.get("num_hidden_layers", 16)
         self.hidden_size = self.config.get("hidden_size", 2048)
@@ -392,7 +388,7 @@ class BaseModel(nn.Module):
         reduction=None,
         **kwargs,
     ) -> torch.Tensor:
-        
+
         def mask_mod(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
             segment_mask = segment_ids[b, q_idx] == segment_ids[b, kv_idx]
@@ -466,16 +462,16 @@ def load_model_from_safetensors(
 
     if not os.path.exists(safetensors_path):
         raise FileNotFoundError(f"safetensors file not found: {safetensors_path}")
-    
+
     # Check if it's a directory (checkpoint) or file
     if os.path.isdir(safetensors_path):
         safetensors_file = os.path.join(safetensors_path, "model.safetensors")
     else:
         safetensors_file = safetensors_path
-        
+
     if not os.path.exists(safetensors_file):
         raise FileNotFoundError(f"Model file not found: {safetensors_file}")
-        
+
     logging.info(f"Loading weights from: {safetensors_file}")
     # Load to CPU first to avoid device issues
     state_dict = load_safetensors_file(safetensors_file, device="cpu")
@@ -500,7 +496,7 @@ def _load_model(target_model, config):
         source_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
 
     target_model.embeddings.weight.data = (source_model.model.embed_tokens.weight.data.clone())
-    
+
     for i in range(len(source_model.model.layers)):
         target_model.layers[i].self_attn.q_proj.layer.weight.data = source_model.model.layers[i].self_attn.q_proj.weight.data.clone()
         target_model.layers[i].self_attn.k_proj.layer.weight.data = source_model.model.layers[i].self_attn.k_proj.weight.data.clone()
@@ -530,7 +526,7 @@ def load_model(
 
     logging.info("Creating BaseModel using merged config...")
     model = BaseModel(merged_config)
-    
+
     if checkpoint_path:
         # Load from local checkpoint (for instruction tuning from our pretrained model)
         logging.info(f"Loading weights from checkpoint: {checkpoint_path}")
@@ -544,7 +540,7 @@ def load_model(
     else:
         # Random initialization (for pretraining from scratch)
         logging.info("Using random initialization for pretraining from scratch")
-    
+
     final_dtype = str_to_dtype(merged_config.get("dtype", "bfloat16"))
     model = model.to(final_dtype)
     logging.info(f"BaseModel ready, dtype={final_dtype}")
