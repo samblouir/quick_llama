@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
   group: openhermes-2-5-exact-token-measurement
@@ -23,6 +24,7 @@ jobs:
       TOKEN_COUNT_BATCH_SIZE: "512"
       TOKEN_COUNT_OUTPUT: results/openhermes-2.5-token-count.json
       TRANSFORMERS_NO_ADVISORY_WARNINGS: "1"
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out measurement revision
         uses: actions/checkout@v4
@@ -48,6 +50,18 @@ jobs:
           python tools/measure_openhermes_2_5_tokens.py 2>&1 | tee results/measurement.log
           python -m pip freeze > results/python-environment.txt
           sha256sum results/* | tee results/artifact-sha256.txt
+
+      - name: Publish the exact result to the measurement issue
+        if: success()
+        run: |
+          {
+            echo '## Exact full-corpus result'
+            echo
+            echo '```json'
+            cat results/openhermes-2.5-token-count.json
+            echo '```'
+          } > results/issue-comment.md
+          gh issue comment 5 --repo "$GITHUB_REPOSITORY" --body-file results/issue-comment.md
 
       - name: Upload auditable results
         if: always()
