@@ -9,6 +9,8 @@ on:
     paths:
       - .github/workflows/measure-openhermes-2-5-tokens.yml
       - tools/measure_openhermes_2_5_tokens.py
+  issues:
+    types: [opened]
   workflow_dispatch:
 
 permissions:
@@ -16,6 +18,7 @@ permissions:
 
 jobs:
   measure:
+    if: github.event_name != 'issues' || github.event.issue.title == '[automation] Measure OpenHermes-2.5 tokens'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
