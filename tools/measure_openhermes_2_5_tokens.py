@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Measure OpenHermes-2.5 with its native OpenHermes/Mistral ChatML tokenizer.
+"""Exact full-corpus token count for teknium/OpenHermes-2.5.
 
-The script deliberately counts the complete dataset rather than sampling. It emits
-revision pins, serialization hashes, token totals, role totals, and length
-statistics so that the result can be independently reproduced.
+The primary measurement is the complete-conversation ChatML serialization used by
+OpenHermes/Axolotl, tokenized with the native OpenHermes-2.5-Mistral-7B fast
+tokenizer. No sampling or byte-to-token extrapolation is used.
 """
 from __future__ import annotations
 
@@ -20,12 +20,15 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from datasets import load_dataset
-from huggingface_hub import HfApi
+import pyarrow.parquet as pq
+from huggingface_hub import HfApi, hf_hub_download
 from transformers import AutoTokenizer
 
 DATASET_ID = "teknium/OpenHermes-2.5"
 TOKENIZER_ID = "teknium/OpenHermes-2.5-Mistral-7B"
+PARQUET_REVISION = "refs/convert/parquet"
+PARQUET_FILENAME = "default/train/0000.parquet"
+EXPECTED_PARQUET_SHA256 = "9d83d1f964b536440458ababe98ce3792dde357b23c8183dc16fb927ef2eeec0"
 EXPECTED_ROWS = 1_001_551
 BATCH_SIZE = int(os.environ.get("TOKEN_COUNT_BATCH_SIZE", "512"))
 OUTPUT_PATH = Path(os.environ.get("TOKEN_COUNT_OUTPUT", "openhermes-2.5-token-count.json"))
@@ -42,6 +45,14 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def sha256_file(path: str | Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def framed_hash_update(hasher: Any, text: str) -> int:
     data = text.encode("utf-8")
     hasher.update(len(data).to_bytes(8, "little", signed=False))
@@ -49,9 +60,8 @@ def framed_hash_update(hasher: Any, text: str) -> int:
     return len(data)
 
 
-def manual_chatml(conversation: list[dict[str, Any]]) -> tuple[str, list[dict[str, str]], Counter[str]]:
+def render_chatml(conversation: list[dict[str, Any]]) -> tuple[str, Counter[str]]:
     pieces: list[str] = []
-    messages: list[dict[str, str]] = []
     unknown = Counter()
     for turn in conversation:
         source_role = str(turn.get("from", ""))
@@ -65,13 +75,10 @@ def manual_chatml(conversation: list[dict[str, Any]]) -> tuple[str, list[dict[st
         elif not isinstance(value, str):
             value = str(value)
         pieces.append(f"<|im_start|>{role}\n{value}<|im_end|>\n")
-        messages.append({"role": role, "content": value})
-    return "".join(pieces), messages, unknown
+    return "".join(pieces), unknown
 
 
 def encode_lengths(backend: Any, texts: list[str]) -> list[int]:
-    if not texts:
-        return []
     return [len(encoded.ids) for encoded in backend.encode_batch(texts, add_special_tokens=False)]
 
 
@@ -98,9 +105,34 @@ def main() -> None:
 
     api = HfApi()
     dataset_info = api.dataset_info(DATASET_ID, files_metadata=True)
+    parquet_info = api.dataset_info(DATASET_ID, revision=PARQUET_REVISION, files_metadata=True)
     model_info = api.model_info(TOKENIZER_ID, files_metadata=True)
     print(f"dataset_revision={dataset_info.sha}", flush=True)
+    print(f"parquet_revision={parquet_info.sha}", flush=True)
     print(f"tokenizer_revision={model_info.sha}", flush=True)
+
+    parquet_path = hf_hub_download(
+        repo_id=DATASET_ID,
+        repo_type="dataset",
+        revision=PARQUET_REVISION,
+        filename=PARQUET_FILENAME,
+    )
+    parquet_sha256 = sha256_file(parquet_path)
+    print(f"parquet_path={parquet_path}", flush=True)
+    print(f"parquet_sha256={parquet_sha256}", flush=True)
+    if parquet_sha256 != EXPECTED_PARQUET_SHA256:
+        raise RuntimeError(
+            f"Parquet SHA-256 mismatch: {parquet_sha256} != {EXPECTED_PARQUET_SHA256}"
+        )
+
+    parquet_file = pq.ParquetFile(parquet_path)
+    row_count = int(parquet_file.metadata.num_rows)
+    print(f"parquet_rows={row_count:,}", flush=True)
+    print(f"parquet_schema={parquet_file.schema_arrow}", flush=True)
+    if row_count != EXPECTED_ROWS:
+        raise RuntimeError(f"Expected {EXPECTED_ROWS:,} rows, found {row_count:,}")
+    if "conversations" not in parquet_file.schema_arrow.names:
+        raise RuntimeError("Parquet has no 'conversations' column")
 
     tokenizer = AutoTokenizer.from_pretrained(
         TOKENIZER_ID,
@@ -112,7 +144,7 @@ def main() -> None:
         raise RuntimeError("A fast tokenizer is required for the full-corpus measurement")
     backend = tokenizer.backend_tokenizer
 
-    special_contract = {
+    tokenizer_contract = {
         "tokenizer_class": tokenizer.__class__.__name__,
         "is_fast": bool(tokenizer.is_fast),
         "vocab_size_property": int(tokenizer.vocab_size),
@@ -131,153 +163,97 @@ def main() -> None:
         "add_eos_token": getattr(tokenizer, "add_eos_token", None),
         "chat_template": getattr(tokenizer, "chat_template", None),
     }
-    print("tokenizer_contract=" + json.dumps(special_contract, ensure_ascii=False, sort_keys=True), flush=True)
-
+    print("tokenizer_contract=" + json.dumps(tokenizer_contract, ensure_ascii=False, sort_keys=True), flush=True)
     for key, expected in {
         "bos_token_id": 1,
         "im_start_id": 32001,
         "im_end_id": 32000,
     }.items():
-        if special_contract[key] != expected:
-            raise RuntimeError(f"Tokenizer contract mismatch for {key}: {special_contract[key]!r} != {expected!r}")
-
-    dataset = load_dataset(
-        DATASET_ID,
-        split="train",
-        revision=dataset_info.sha,
-        trust_remote_code=False,
-    )
-    row_count = len(dataset)
-    print(f"loaded_rows={row_count:,}", flush=True)
-    print(f"columns={dataset.column_names}", flush=True)
-    print(f"features={dataset.features}", flush=True)
-    if row_count != EXPECTED_ROWS:
-        raise RuntimeError(f"Expected {EXPECTED_ROWS:,} rows, found {row_count:,}")
-    if "conversations" not in dataset.column_names:
-        raise RuntimeError("Dataset has no 'conversations' column")
+        if tokenizer_contract[key] != expected:
+            raise RuntimeError(
+                f"Tokenizer contract mismatch for {key}: {tokenizer_contract[key]!r} != {expected!r}"
+            )
 
     canonical_lengths = array("Q")
-    no_final_newline_lengths = array("Q")
     turn_lengths = array("Q")
-    content_lengths = array("Q")
-
+    canonical_hash = hashlib.sha256()
+    canonical_utf8_bytes = 0
     role_turn_counts: Counter[str] = Counter()
-    role_content_tokens: Counter[str] = Counter()
     source_role_counts: Counter[str] = Counter()
     unknown_role_counts: Counter[str] = Counter()
     conversations_with_system = 0
     empty_messages = 0
     weighted_messages = 0
-    total_chars = 0
-    total_utf8_bytes = 0
-    canonical_utf8_bytes = 0
-    canonical_hash = hashlib.sha256()
-    no_final_newline_hash = hashlib.sha256()
-    running_canonical_total = 0
-
-    template_probe: dict[str, Any] = {
-        "available": bool(getattr(tokenizer, "chat_template", None)),
-        "checked_rows": 0,
-        "equal_to_manual": None,
-        "first_mismatch_row": None,
-        "manual_preview": None,
-        "template_preview": None,
-    }
-
+    content_characters = 0
+    content_utf8_bytes = 0
+    running_token_total = 0
     processed = 0
-    for start in range(0, row_count, BATCH_SIZE):
-        stop = min(start + BATCH_SIZE, row_count)
-        conversations = dataset[start:stop]["conversations"]
 
-        canonical_texts: list[str] = []
-        no_final_newline_texts: list[str] = []
-        batch_content_texts: list[str] = []
-        batch_content_roles: list[str] = []
+    for record_batch in parquet_file.iter_batches(
+        batch_size=BATCH_SIZE,
+        columns=["conversations"],
+        use_threads=True,
+    ):
+        conversations = record_batch.column(0).to_pylist()
+        rendered_batch: list[str] = []
 
-        for local_index, conversation in enumerate(conversations):
+        for conversation in conversations:
             if conversation is None:
                 conversation = []
-            text, messages, unknown = manual_chatml(conversation)
+            text, unknown = render_chatml(conversation)
+            rendered_batch.append(text)
             unknown_role_counts.update(unknown)
-            canonical_texts.append(text)
-            no_final = text[:-1] if text.endswith("\n") else text
-            no_final_newline_texts.append(no_final)
             turn_lengths.append(len(conversation))
+            canonical_utf8_bytes += framed_hash_update(canonical_hash, text)
 
-            if any(message["role"] == "system" for message in messages):
-                conversations_with_system += 1
-
-            for original_turn, message in zip(conversation, messages):
-                source_role = str(original_turn.get("from", ""))
-                role = message["role"]
-                value = message["content"]
+            has_system = False
+            for turn in conversation:
+                source_role = str(turn.get("from", ""))
+                role = ROLE_MAP.get(source_role, source_role)
+                value = turn.get("value", "")
+                if value is None:
+                    value = ""
+                elif not isinstance(value, str):
+                    value = str(value)
                 source_role_counts[source_role] += 1
                 role_turn_counts[role] += 1
-                if value == "":
-                    empty_messages += 1
-                if original_turn.get("weight") is not None:
-                    weighted_messages += 1
-                total_chars += len(value)
-                total_utf8_bytes += len(value.encode("utf-8"))
-                batch_content_texts.append(value)
-                batch_content_roles.append(role)
+                has_system = has_system or role == "system"
+                empty_messages += int(value == "")
+                weighted_messages += int(turn.get("weight") is not None)
+                content_characters += len(value)
+                content_utf8_bytes += len(value.encode("utf-8"))
+            conversations_with_system += int(has_system)
 
-            canonical_utf8_bytes += framed_hash_update(canonical_hash, text)
-            framed_hash_update(no_final_newline_hash, no_final)
+        lengths = encode_lengths(backend, rendered_batch)
+        canonical_lengths.extend(lengths)
+        running_token_total += sum(lengths)
+        processed += len(conversations)
 
-            if template_probe["available"] and template_probe["checked_rows"] < 100:
-                row_index = start + local_index
-                rendered = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
-                equal = rendered == text
-                template_probe["checked_rows"] += 1
-                if template_probe["equal_to_manual"] is None:
-                    template_probe["equal_to_manual"] = True
-                if not equal:
-                    template_probe["equal_to_manual"] = False
-                    if template_probe["first_mismatch_row"] is None:
-                        template_probe["first_mismatch_row"] = row_index
-                        template_probe["manual_preview"] = text[:1000]
-                        template_probe["template_preview"] = rendered[:1000]
-
-        batch_canonical_lengths = encode_lengths(backend, canonical_texts)
-        batch_no_final_lengths = encode_lengths(backend, no_final_newline_texts)
-        batch_content_lengths = encode_lengths(backend, batch_content_texts)
-
-        canonical_lengths.extend(batch_canonical_lengths)
-        no_final_newline_lengths.extend(batch_no_final_lengths)
-        content_lengths.extend(batch_content_lengths)
-        running_canonical_total += sum(batch_canonical_lengths)
-        for role, length in zip(batch_content_roles, batch_content_lengths):
-            role_content_tokens[role] += length
-
-        processed = stop
         if processed == row_count or processed % 10_000 < BATCH_SIZE:
             elapsed = time.monotonic() - started
             print(
                 f"progress rows={processed:,}/{row_count:,} "
-                f"canonical_tokens={running_canonical_total:,} "
+                f"canonical_tokens={running_token_total:,} "
                 f"rows_per_second={processed / max(elapsed, 1e-9):.1f} "
                 f"elapsed_seconds={elapsed:.1f}",
                 flush=True,
             )
 
-    canonical_total = int(sum(canonical_lengths))
-    no_final_newline_total = int(sum(no_final_newline_lengths))
-    content_total = int(sum(content_lengths))
-    turn_count = int(sum(turn_lengths))
+    if processed != row_count:
+        raise RuntimeError(f"Processed {processed:,} rows, expected {row_count:,}")
 
-    thresholds: dict[str, dict[str, int]] = {}
+    canonical_total = int(sum(canonical_lengths))
+    turn_count = int(sum(turn_lengths))
     canonical_np = np.frombuffer(canonical_lengths, dtype=np.uint64)
-    for threshold in (2048, 4096, 8192, 16384, 32768):
+    truncation: dict[str, dict[str, int]] = {}
+    for threshold in (1024, 2048, 4096, 8192, 16384, 32768):
         clipped = np.minimum(canonical_np, threshold)
-        thresholds[str(threshold)] = {
+        truncation[str(threshold)] = {
             "conversations_over": int(np.count_nonzero(canonical_np > threshold)),
             "tokens_retained_if_each_conversation_truncated": int(clipped.sum(dtype=np.uint64)),
-            "tokens_dropped_if_each_conversation_truncated": int((canonical_np - clipped).sum(dtype=np.uint64)),
+            "tokens_dropped_if_each_conversation_truncated": int(
+                (canonical_np - clipped).sum(dtype=np.uint64)
+            ),
         }
 
     elapsed = time.monotonic() - started
@@ -290,34 +266,34 @@ def main() -> None:
             "platform": platform.platform(),
             "python": sys.version,
             "batch_size": BATCH_SIZE,
+            "method": "full corpus; no sampling or extrapolation",
         },
         "source": {
             "dataset_id": DATASET_ID,
             "dataset_revision": dataset_info.sha,
-            "dataset_rows": row_count,
-            "dataset_columns": list(dataset.column_names),
+            "parquet_revision": parquet_info.sha,
+            "parquet_filename": PARQUET_FILENAME,
+            "parquet_sha256": parquet_sha256,
+            "parquet_rows": row_count,
             "tokenizer_id": TOKENIZER_ID,
             "tokenizer_revision": model_info.sha,
         },
-        "tokenizer_contract": special_contract,
         "serialization": {
             "name": "OpenHermes/Axolotl ChatML completed-conversation form",
             "per_message": "<|im_start|>{mapped_role}\\n{value}<|im_end|>\\n",
             "role_mapping": ROLE_MAP,
             "canonical_includes_bos": False,
             "canonical_has_final_newline": True,
-            "bos_variant_definition": "canonical token count plus one BOS token per conversation",
-            "content_only_definition": "each message value encoded independently with add_special_tokens=False",
+            "one_bos_variant": "canonical token count plus exactly one BOS token per conversation",
         },
+        "tokenizer_contract": tokenizer_contract,
         "integrity": {
             "expected_rows": EXPECTED_ROWS,
-            "row_count_matches": row_count == EXPECTED_ROWS,
             "processed_rows": processed,
+            "row_count_matches": processed == EXPECTED_ROWS,
             "canonical_framed_sha256": canonical_hash.hexdigest(),
-            "canonical_no_final_newline_framed_sha256": no_final_newline_hash.hexdigest(),
             "canonical_utf8_payload_bytes": canonical_utf8_bytes,
             "unknown_role_counts": dict(sorted(unknown_role_counts.items())),
-            "template_probe": template_probe,
         },
         "counts": {
             "conversations": row_count,
@@ -325,33 +301,26 @@ def main() -> None:
             "conversations_with_system": conversations_with_system,
             "empty_messages": empty_messages,
             "messages_with_non_null_weight": weighted_messages,
-            "content_characters": total_chars,
-            "content_utf8_bytes": total_utf8_bytes,
+            "content_characters": content_characters,
+            "content_utf8_bytes": content_utf8_bytes,
             "source_role_turns": dict(sorted(source_role_counts.items())),
             "mapped_role_turns": dict(sorted(role_turn_counts.items())),
         },
         "tokens": {
             "canonical_chatml_no_bos": canonical_total,
             "canonical_chatml_one_bos_per_conversation": canonical_total + row_count,
-            "canonical_chatml_no_final_newline_no_bos": no_final_newline_total,
-            "independently_tokenized_message_content_only": content_total,
-            "role_content_only": dict(sorted(role_content_tokens.items())),
-            "canonical_minus_independent_content": canonical_total - content_total,
-            "mean_canonical_tokens_per_conversation": canonical_total / row_count,
-            "mean_canonical_tokens_per_turn": canonical_total / turn_count,
+            "mean_canonical_tokens_per_conversation_no_bos": canonical_total / row_count,
+            "mean_canonical_tokens_per_turn_no_bos": canonical_total / turn_count,
         },
         "distributions": {
-            "canonical_tokens_per_conversation": percentile_summary(canonical_lengths),
-            "no_final_newline_tokens_per_conversation": percentile_summary(no_final_newline_lengths),
-            "content_tokens_per_message": percentile_summary(content_lengths),
+            "canonical_tokens_per_conversation_no_bos": percentile_summary(canonical_lengths),
             "turns_per_conversation": percentile_summary(turn_lengths),
         },
-        "per_conversation_truncation": thresholds,
+        "per_conversation_truncation_no_bos": truncation,
     }
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_PATH.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-
     print("RESULT_JSON_BEGIN", flush=True)
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), flush=True)
     print("RESULT_JSON_END", flush=True)
