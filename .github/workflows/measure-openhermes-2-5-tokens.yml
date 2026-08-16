@@ -1,10 +1,11 @@
-# Temporary full-corpus measurement workflow; removed after the result is collected.
+# Temporary full-corpus measurement workflow; branch is reset after the result is collected.
 name: Measure OpenHermes-2.5 tokens
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
+  push:
+    branches:
+      - tmp/measure-openhermes-exact-run
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -17,7 +18,7 @@ concurrency:
 jobs:
   measure:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
     env:
       HF_HOME: ${{ runner.temp }}/huggingface
       TOKENIZERS_PARALLELISM: "true"
