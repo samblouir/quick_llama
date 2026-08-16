@@ -1,9 +1,9 @@
-# One-time, full-corpus measurement workflow.
+# Temporary full-corpus measurement workflow; removed after the result is collected.
 name: Measure OpenHermes-2.5 tokens
 
 on:
   schedule:
-    - cron: "15 7 16 8 *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
