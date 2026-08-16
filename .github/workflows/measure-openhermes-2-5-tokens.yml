@@ -3,6 +3,7 @@ name: Measure OpenHermes-2.5 tokens
 on:
   push:
     branches:
+      - main
       - measure/openhermes-2-5-token-count-20260816
     paths:
       - .github/workflows/measure-openhermes-2-5-tokens.yml
@@ -23,7 +24,7 @@ jobs:
       TOKEN_COUNT_OUTPUT: results/openhermes-2.5-token-count.json
       TRANSFORMERS_NO_ADVISORY_WARNINGS: "1"
     steps:
-      - name: Check out measurement branch
+      - name: Check out measurement revision
         uses: actions/checkout@v4
 
       - name: Set up Python
