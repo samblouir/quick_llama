@@ -1,0 +1,57 @@
+name: Measure OpenHermes-2.5 tokens
+
+on:
+  push:
+    branches:
+      - measure/openhermes-2-5-token-count-20260816
+    paths:
+      - .github/workflows/measure-openhermes-2-5-tokens.yml
+      - tools/measure_openhermes_2_5_tokens.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      HF_HOME: ${{ runner.temp }}/huggingface
+      TOKENIZERS_PARALLELISM: "true"
+      TOKEN_COUNT_BATCH_SIZE: "512"
+      TOKEN_COUNT_OUTPUT: results/openhermes-2.5-token-count.json
+      TRANSFORMERS_NO_ADVISORY_WARNINGS: "1"
+    steps:
+      - name: Check out measurement branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install pinned measurement environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            "datasets==4.0.0" \
+            "transformers==4.55.2" \
+            "sentencepiece==0.2.0"
+
+      - name: Measure the complete dataset
+        run: |
+          mkdir -p results
+          python tools/measure_openhermes_2_5_tokens.py 2>&1 | tee results/measurement.log
+          python -m pip freeze > results/python-environment.txt
+          sha256sum results/* | tee results/artifact-sha256.txt
+
+      - name: Upload auditable results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openhermes-2.5-token-count
+          path: results/
+          if-no-files-found: error
+          retention-days: 30
